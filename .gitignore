@@ -14,7 +14,6 @@ dist/
 # Virtual environments
 .venv/
 venv/
-ENV/
 
 # Training artifacts
 tb_logs/
