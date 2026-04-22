@@ -34,7 +34,8 @@ from ..sim.physics import RobotState, apply_command, initial_robot, step_physics
 from ..sim.sensors import sample_sensors
 from ..sim.world import DEFAULT_SPAWN, build_default_world
 from .robot_env import (
-    ACTION_L2_PENALTY, build_observation, sensors_to_mm, steer_deg_to_servo_count,
+    ACTION_L2_PENALTY, build_observation, ir_reward_component,
+    lidar_proximity_penalty, sensors_to_mm, steer_deg_to_servo_count,
 )
 
 
@@ -169,21 +170,13 @@ class MultiRobotVecEnv(VecEnv):
             progressing = 1.0 if d * direction > 0 else 0.0
             speed_r = 0.2 * speed_frac * progressing
 
-        min_dist = min(
-            sensors["lidar"]["center"]["distance_cm"],
-            sensors["lidar"]["left"]["distance_cm"],
-            sensors["lidar"]["right"]["distance_cm"],
-            sensors["ir"]["left"]["distance_cm"]
-                if sensors["ir"]["left"]["valid"] else 99.0,
-            sensors["ir"]["right"]["distance_cm"]
-                if sensors["ir"]["right"]["valid"] else 99.0,
-        )
-        proximity_pen = (10.0 - max(3.0, min_dist)) * 0.05 if min_dist < 10.0 else 0.0
+        lidar_pen = lidar_proximity_penalty(sensors)
+        ir_r_signed = ir_reward_component(sensors, self._ep_direction[i])
 
         a = np.clip(action.astype(np.float32), -1.0, 1.0)
         action_pen = ACTION_L2_PENALTY * float(np.dot(a, a)) / NUM_OUTPUTS
 
-        return lap_r + speed_r - proximity_pen - action_pen
+        return lap_r + speed_r - lidar_pen + ir_r_signed - action_pen
 
     def _apply_action(self, i: int, action: np.ndarray, walls: list[Segment]) -> None:
         sensors = sample_sensors(walls, self._states[i].pose, self._cal)

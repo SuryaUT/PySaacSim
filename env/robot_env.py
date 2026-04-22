@@ -56,6 +56,62 @@ CalibrationArg = Union[SensorCalibration, str, Path, None]
 # when PD is already good. Tuned conservatively per spec section 9.
 ACTION_L2_PENALTY = 0.05
 
+# Proximity-shaping knobs used by _reward (and MultiRobotVecEnv).
+# LiDARs are always penalized for closeness — they detect forward / ±45°
+# crash paths. Side IRs get a sweet-spot bonus on the *inside* of the chosen
+# lap direction, so the policy learns to hug the inside wall for shorter laps.
+LIDAR_PROX_THRESHOLD_CM = 10.0
+LIDAR_PROX_FLOOR_CM     = 3.0
+LIDAR_PROX_SCALE        = 0.05
+IR_SAFETY_FLOOR_CM      = 5.0   # "couple of inches" — below this both IRs hurt
+IR_SAFETY_FLOOR_MIN_CM  = 3.0   # clamp so penalty doesn't grow unbounded
+IR_SAFETY_SCALE         = 0.05
+IR_INSIDE_BAND_MAX_CM   = 12.0  # inside IR gets bonus when reading ≤ this
+IR_INSIDE_BONUS         = 0.05  # per step while inside IR sits in sweet spot
+
+
+def lidar_proximity_penalty(sensors: dict) -> float:
+    """Always-on crash-imminent penalty across the 3 LiDARs. Returns ≥ 0."""
+    min_d = min(
+        sensors["lidar"]["center"]["distance_cm"],
+        sensors["lidar"]["left"]["distance_cm"],
+        sensors["lidar"]["right"]["distance_cm"],
+    )
+    if min_d >= LIDAR_PROX_THRESHOLD_CM:
+        return 0.0
+    return (LIDAR_PROX_THRESHOLD_CM - max(LIDAR_PROX_FLOOR_CM, min_d)) * LIDAR_PROX_SCALE
+
+
+def ir_reward_component(sensors: dict, direction: int) -> float:
+    """Signed reward contribution from the two side IRs.
+
+    Returns positive when the inside IR is in the racing-line sweet spot,
+    negative when either IR drops below the safety floor, zero otherwise.
+    `direction`: +1 CCW (left inside), -1 CW (right inside), 0 unknown
+    (no bonus yet, only safety floor is active).
+    """
+    ir_l = sensors["ir"]["left"]
+    ir_r = sensors["ir"]["right"]
+    total = 0.0
+
+    # Safety floor — active regardless of direction. Don't let the policy
+    # shave the wall off even on the "rewarded" side.
+    if ir_l["valid"] and ir_l["distance_cm"] < IR_SAFETY_FLOOR_CM:
+        d = max(IR_SAFETY_FLOOR_MIN_CM, ir_l["distance_cm"])
+        total -= (IR_SAFETY_FLOOR_CM - d) * IR_SAFETY_SCALE
+    if ir_r["valid"] and ir_r["distance_cm"] < IR_SAFETY_FLOOR_CM:
+        d = max(IR_SAFETY_FLOOR_MIN_CM, ir_r["distance_cm"])
+        total -= (IR_SAFETY_FLOOR_CM - d) * IR_SAFETY_SCALE
+
+    # Inside-wall bonus — only once direction is locked.
+    if direction == 0:
+        return total
+    inside = ir_l if direction == +1 else ir_r
+    if (inside["valid"]
+            and IR_SAFETY_FLOOR_CM <= inside["distance_cm"] <= IR_INSIDE_BAND_MAX_CM):
+        total += IR_INSIDE_BONUS
+    return total
+
 
 def steer_deg_to_servo_count(steer_deg: float) -> int:
     """Inverse of `servo_count_to_steer_angle`. +deg = right turn ⇒ count > center."""
@@ -288,11 +344,14 @@ class RobotEnv(gym.Env):
         return float(np.arctan2(y - cy, x - cx))
 
     def _reward(self, sensors: dict, action) -> float:
-        """Direction-agnostic lap reward + small L2 penalty on the residual.
+        """Direction-aware lap reward + inside-wall shaping + L2 residual penalty.
 
         Lap progress: signed Δangle around the track centroid; episode picks
         its own direction on first decisive motion. Speed bonus only while
         progressing in the chosen direction. Crash terminates with -100.
+        LiDARs always incur a proximity penalty (crash paths). Inside IR
+        (left for CCW, right for CW) gets a sweet-spot bonus once direction
+        is locked — encourages tight racing lines. Safety floor on both IRs.
         Action L2 penalty discourages large residuals — matches spec section 9.
         """
         if self._state.collided:
@@ -320,18 +379,10 @@ class RobotEnv(gym.Env):
             progressing = 1.0 if d_angle * direction > 0 else 0.0
             speed_r = 0.2 * speed_frac * progressing
 
-        min_dist = min(
-            sensors["lidar"]["center"]["distance_cm"],
-            sensors["lidar"]["left"]["distance_cm"],
-            sensors["lidar"]["right"]["distance_cm"],
-            sensors["ir"]["left"]["distance_cm"]
-                if sensors["ir"]["left"]["valid"] else 99.0,
-            sensors["ir"]["right"]["distance_cm"]
-                if sensors["ir"]["right"]["valid"] else 99.0,
-        )
-        proximity_pen = (10.0 - max(3.0, min_dist)) * 0.05 if min_dist < 10.0 else 0.0
+        lidar_pen = lidar_proximity_penalty(sensors)
+        ir_r_signed = ir_reward_component(sensors, self._ep_direction)
 
         a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         action_pen = ACTION_L2_PENALTY * float(np.dot(a, a)) / NUM_OUTPUTS
 
-        return lap_r + speed_r - proximity_pen - action_pen
+        return lap_r + speed_r - lidar_pen + ir_r_signed - action_pen
