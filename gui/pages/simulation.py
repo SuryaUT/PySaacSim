@@ -17,12 +17,17 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ...env.robot_env import RobotEnv, THROTTLE_MIN  # noqa: F401
+from ...control.pd_baseline import PDBaseline, compute_geometry, ir_correction
+from ...env.robot_env import (
+    RobotEnv, build_observation, sensors_to_mm, steer_deg_to_servo_count,
+)
 from ...sim.constants import (
     MAX_SPEED_CMS, MOTOR_PWM_MAX_COUNT, PHYSICS_DT_S, SERVO_CENTER_COUNT,
     SERVO_MAX_COUNT, SERVO_MIN_COUNT, STEER_LIMIT_RAD,
 )
 from ...sim.geometry import chassis_segments
+from ...sim.imu import IMUSimulator
+from ...sim.model import action_to_delta, apply_residual
 from ...sim.physics import RobotState, apply_command, initial_robot, step_physics
 from ...sim.sensors import sample_sensors
 from ..app_state import AppState, RobotSpec
@@ -38,36 +43,6 @@ CTRL_PERIOD_MS = 80.0
 PHYSICS_HZ = 60  # how often the GUI timer fires
 
 
-def _obs_from_sensors(sensors: dict, state: RobotState,
-                      lidar_max: float, ir_max: float) -> np.ndarray:
-    lc = sensors["lidar"]["center"]["distance_cm"] / lidar_max
-    ll = sensors["lidar"]["left"]["distance_cm"] / lidar_max
-    lr = sensors["lidar"]["right"]["distance_cm"] / lidar_max
-    il = sensors["ir"]["left"]["distance_cm"] / ir_max
-    ir = sensors["ir"]["right"]["distance_cm"] / ir_max
-    v = state.v / MAX_SPEED_CMS
-    om = max(-1.0, min(1.0, state.omega / 5.0))
-    st = state.steer_angle / STEER_LIMIT_RAD
-    return np.array([lc, ll, lr, il, ir, v, om, st], dtype=np.float32)
-
-
-def _action_to_command(servo_norm: float, tL_norm: float, tR_norm: float):
-    """Map RL action (3D: servo, throttle_L, throttle_R) → (duty_l, duty_r, servo_count).
-    Must stay in lockstep with RobotEnv.step()."""
-    servo_norm = max(-1.0, min(1.0, servo_norm))
-    tL_norm    = max(-1.0, min(1.0, tL_norm))
-    tR_norm    = max(-1.0, min(1.0, tR_norm))
-    if servo_norm >= 0:
-        servo = int(SERVO_CENTER_COUNT + servo_norm * (SERVO_MAX_COUNT - SERVO_CENTER_COUNT))
-    else:
-        servo = int(SERVO_CENTER_COUNT + servo_norm * (SERVO_CENTER_COUNT - SERVO_MIN_COUNT))
-    throttle_l = THROTTLE_MIN + (tL_norm + 1.0) * 0.5 * (1.0 - THROTTLE_MIN)
-    throttle_r = THROTTLE_MIN + (tR_norm + 1.0) * 0.5 * (1.0 - THROTTLE_MIN)
-    duty_l = int(throttle_l * MOTOR_PWM_MAX_COUNT)
-    duty_r = int(throttle_r * MOTOR_PWM_MAX_COUNT)
-    return duty_l, duty_r, servo
-
-
 class SimulationPage(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
@@ -78,6 +53,9 @@ class SimulationPage(QWidget):
         self._W: Optional[np.ndarray] = None
         self._b: Optional[np.ndarray] = None
         self._steps_since_ctrl: dict[int, float] = {}
+        # Per-robot policy state for the residual RL controller (see
+        # _compute_command "rl" branch). Lazy-init in _ensure_rl_state.
+        self._rl_state: dict[int, dict] = {}
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -467,6 +445,7 @@ class SimulationPage(QWidget):
         if rid in self._runtimes:
             self._runtimes[rid] = initial_robot(x, y, theta)
             self._steps_since_ctrl[rid] = 0.0
+            self._reset_rl_state(rid)
 
     def _on_sel_edited(self) -> None:
         if self._selected_robot is None:
@@ -488,6 +467,7 @@ class SimulationPage(QWidget):
                 self.sel_x.value(), self.sel_y.value(),
                 math.radians(self.sel_theta.value()))
             self._steps_since_ctrl[rid] = 0.0
+            self._reset_rl_state(rid)
 
     def _on_ring_angle(self, rid: int, theta: float) -> None:
         self.state.update_robot(rid, theta=theta)
@@ -500,6 +480,7 @@ class SimulationPage(QWidget):
             if spec is not None:
                 self._runtimes[rid] = initial_robot(spec.x, spec.y, theta)
                 self._steps_since_ctrl[rid] = 0.0
+                self._reset_rl_state(rid)
         self.canvas.sync_ring_to_selected()
 
     def _rotate_selected(self, direction: int) -> None:
@@ -521,6 +502,7 @@ class SimulationPage(QWidget):
         if spec.id in self._runtimes:
             self._runtimes[spec.id] = initial_robot(spec.x, spec.y, new_theta)
             self._steps_since_ctrl[spec.id] = 0.0
+            self._reset_rl_state(spec.id)
 
     # ---- sim loop --------------------------------------------------------
 
@@ -538,6 +520,7 @@ class SimulationPage(QWidget):
     def _reset_runtimes(self) -> None:
         self._runtimes = {}
         self._steps_since_ctrl = {}
+        self._rl_state = {}
         self._ensure_runtimes()
         self.canvas._rebuild_robots()  # snap visuals back
         self._update_telemetry()
@@ -554,6 +537,7 @@ class SimulationPage(QWidget):
             if rid not in live_ids:
                 self._runtimes.pop(rid, None)
                 self._steps_since_ctrl.pop(rid, None)
+                self._rl_state.pop(rid, None)
 
     def _tick(self) -> None:
         self._ensure_runtimes()
@@ -594,6 +578,7 @@ class SimulationPage(QWidget):
                     and self.chk_respawn.isChecked()):
                 self._runtimes[r.id] = initial_robot(r.x, r.y, r.theta)
                 self._steps_since_ctrl[r.id] = 0.0
+                self._reset_rl_state(r.id)
                 state = self._runtimes[r.id]
             # Push to canvas visuals.
             item = self.canvas._robot_items.get(r.id)
@@ -618,6 +603,29 @@ class SimulationPage(QWidget):
                                         dims.chassis_width_cm))
         return out
 
+    def _ensure_rl_state(self, rid: int) -> dict:
+        s = self._rl_state.get(rid)
+        if s is None:
+            s = {
+                "pd": PDBaseline(),
+                "imu": IMUSimulator(),
+                "prev_thr_l": 0.0,
+                "prev_thr_r": 0.0,
+                "prev_steer": 0.0,
+                "sim_t_s": 0.0,
+            }
+            self._rl_state[rid] = s
+        return s
+
+    def _reset_rl_state(self, rid: int) -> None:
+        s = self._ensure_rl_state(rid)
+        s["pd"].reset()
+        s["imu"].reset(v_cms=0.0, t_s=0.0)
+        s["prev_thr_l"] = 0.0
+        s["prev_thr_r"] = 0.0
+        s["prev_steer"] = 0.0
+        s["sim_t_s"] = 0.0
+
     def _compute_command(self, spec: RobotSpec, state: RobotState, sensors: dict):
         """Returns (duty_l, duty_r, servo_count) — differential drive."""
         cid = spec.controller_id
@@ -626,14 +634,34 @@ class SimulationPage(QWidget):
         if cid == "manual-drive":
             return 9000, 9000, SERVO_CENTER_COUNT
         if cid == "rl":
+            # Residual-on-PD: policy outputs a delta added to the PD baseline.
+            # Untrained policy (zero W, zero b) ⇒ delta=0 ⇒ pure PD behavior,
+            # so the car drives reasonably even before training kicks in.
+            rs = self._ensure_rl_state(spec.id)
+            d_ir, ld_ir, d2, ld2, front = sensors_to_mm(sensors)
+            d_ir, ld_ir = ir_correction(d_ir, ld_ir, d2, ld2)
+            geom = compute_geometry(d_ir, ld_ir, d2, ld2, front)
+            pd = rs["pd"].tick(geom)
             if self._W is None or self._b is None:
-                return 0, 0, SERVO_CENTER_COUNT
-            obs = _obs_from_sensors(sensors, state,
-                                    self.state.calibration.lidar.max_cm,
-                                    self.state.calibration.ir.max_cm)
-            action = policy_forward(self._W, self._b, obs)
-            return _action_to_command(float(action[0]), float(action[1]),
-                                      float(action[2]))
+                # No model loaded — fall back to pure PD (safe default).
+                thr_l, thr_r, steer_deg = pd.throttle_l, pd.throttle_r, pd.steering
+            else:
+                rs["sim_t_s"] += CTRL_PERIOD_MS / 1000.0
+                gz, ax, ay = rs["imu"].read(state, rs["sim_t_s"])
+                obs = build_observation(
+                    sensors, gz, ax, ay,
+                    rs["prev_thr_l"], rs["prev_thr_r"], rs["prev_steer"],
+                )
+                action = policy_forward(self._W, self._b, obs)
+                d_thr_l, d_thr_r, d_steer = action_to_delta(action)
+                thr_l, thr_r, steer_deg = apply_residual(
+                    pd.throttle_l, pd.throttle_r, pd.steering,
+                    d_thr_l, d_thr_r, d_steer,
+                )
+            rs["prev_thr_l"] = thr_l
+            rs["prev_thr_r"] = thr_r
+            rs["prev_steer"] = steer_deg
+            return int(thr_l), int(thr_r), steer_deg_to_servo_count(steer_deg)
         # Named C/Python controller (e.g. pd_controller.c) — already differential.
         ctrl = self.state.controllers.get(cid)
         if ctrl is None:

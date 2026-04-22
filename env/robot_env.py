@@ -1,15 +1,26 @@
-"""Gymnasium environment wrapping the PySaacSim physics + sensors + calibration.
+"""Gymnasium env for the residual-on-PD architecture (see Model_Interface.md).
 
-Observation (8-dim float32, all normalized):
-  [lidar_center, lidar_left, lidar_right, ir_left, ir_right, v, omega, steer]
+Observation (13-dim float32, all in [0, 1] — Q16/65536 semantics):
+  matches input_t in Model.h:
+    [ir_right, ir_left, tf_left, tf_middle, tf_right,
+     throttle_left_prev, throttle_right_prev, steering_prev,
+     angle_left, angle_right,
+     yaw_rate, accel_lat, accel_long]
 
-Action (2-dim float32):
-  [servo_norm ∈ [-1, +1], throttle ∈ [0, 1]]
+Action (3-dim float32 ∈ [-1, +1]):
+  matches output_t in Model.h:
+    [throttle_left_delta, throttle_right_delta, steering_delta]
+  action 0 ⇒ pure PD baseline; ±1 ⇒ ±CAP_DELTA_*.
 
-Can be driven either by:
-  - RL agents (via step(action))
-  - A C/Python controller (pass `controller=` to __init__; step() ignores
-    its action argument and polls the controller each control period).
+Step pipeline (matches spec section 7):
+  1. Sample sensors → mm
+  2. IR correction (firmware lines 448-449)
+  3. Compute geometry → run PD baseline
+  4. Build model input vector (uses prev-applied actions)
+  5. RL action gives the delta — env.apply_residual + clamp
+  6. Convert applied (throttle_l, throttle_r, steering_deg) → physics command
+  7. Integrate physics for one control period
+  8. Read IMU; build next observation
 """
 from __future__ import annotations
 
@@ -19,12 +30,20 @@ from typing import Any, Optional, Union
 import gymnasium as gym
 import numpy as np
 
-from ..control.base import AbstractController, MotorCommand
+from ..control.pd_baseline import (
+    PDBaseline, clamp_angle_for_model, compute_geometry, ir_correction,
+)
 from ..sim.calibration import SensorCalibration
 from ..sim.constants import (
     CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM, MAX_SPEED_CMS, MOTOR_PWM_MAX_COUNT,
     PHYSICS_DT_S, SERVO_CENTER_COUNT, SERVO_MAX_COUNT, SERVO_MIN_COUNT,
     STEER_LIMIT_RAD,
+)
+from ..sim.imu import IMUSimulator
+from ..sim.model import (
+    CAP_ACCEL, CAP_IR, CAP_STEERING, CAP_THROTTLE, CAP_TFLUNA, CAP_YAW,
+    Inp, NUM_INPUTS, NUM_OUTPUTS, Q16_HALF, action_to_delta, apply_residual,
+    encode_angle, normalize, normalize_signed,
 )
 from ..sim.physics import RobotState, apply_command, initial_robot, step_physics
 from ..sim.sensors import sample_sensors
@@ -33,14 +52,64 @@ from ..sim.world import DEFAULT_SPAWN, build_default_world
 
 CalibrationArg = Union[SensorCalibration, str, Path, None]
 
-# Floor on the throttle action. Keeps the robot always moving so PPO gets
-# gradient from the reward shape rather than stalling at 0 throttle.
-THROTTLE_MIN = 0.3
+# L2 penalty on the residual delta — discourages the model from fighting PD
+# when PD is already good. Tuned conservatively per spec section 9.
+ACTION_L2_PENALTY = 0.05
+
+
+def steer_deg_to_servo_count(steer_deg: float) -> int:
+    """Inverse of `servo_count_to_steer_angle`. +deg = right turn ⇒ count > center."""
+    t = max(-1.0, min(1.0, steer_deg / CAP_STEERING))
+    if t >= 0:
+        return int(round(SERVO_CENTER_COUNT + t * (SERVO_MAX_COUNT - SERVO_CENTER_COUNT)))
+    return int(round(SERVO_CENTER_COUNT + t * (SERVO_CENTER_COUNT - SERVO_MIN_COUNT)))
+
+
+def sensors_to_mm(sensors: dict) -> tuple[int, int, int, int, int]:
+    """Pull out the 5 distance readings in mm (firmware units)."""
+    d_ir   = int(round(sensors["ir"]["right"]["distance_cm"]    * 10))
+    ld_ir  = int(round(sensors["ir"]["left"]["distance_cm"]     * 10))
+    d2     = int(round(sensors["lidar"]["right"]["distance_cm"] * 10))
+    ld2    = int(round(sensors["lidar"]["left"]["distance_cm"]  * 10))
+    front  = int(round(sensors["lidar"]["center"]["distance_cm"] * 10))
+    return d_ir, ld_ir, d2, ld2, front
+
+
+def build_observation(
+    sensors: dict,
+    raw_gyro_z: int, raw_accel_x: int, raw_accel_y: int,
+    prev_thr_l: float, prev_thr_r: float, prev_steer_deg: float,
+) -> np.ndarray:
+    """Build the 13-element float32 observation in [0, 1].
+
+    Mirrors the firmware's `Model_Inputs[...]` packing in `Robot()` lines
+    491-512. The IR correction has already been applied to (d_ir, ld_ir).
+    """
+    d_ir, ld_ir, d2, ld2, front = sensors_to_mm(sensors)
+    d_ir, ld_ir = ir_correction(d_ir, ld_ir, d2, ld2)
+    geom = compute_geometry(d_ir, ld_ir, d2, ld2, front)
+
+    obs = np.zeros(NUM_INPUTS, dtype=np.float32)
+    obs[Inp.ir_right]            = normalize(d_ir,  CAP_IR)
+    obs[Inp.ir_left]             = normalize(ld_ir, CAP_IR)
+    obs[Inp.tf_left]             = normalize(ld2,   CAP_TFLUNA)
+    obs[Inp.tf_middle]           = normalize(front, CAP_TFLUNA)
+    obs[Inp.tf_right]            = normalize(d2,    CAP_TFLUNA)
+    obs[Inp.throttle_left_prev]  = normalize(prev_thr_l, CAP_THROTTLE)
+    obs[Inp.throttle_right_prev] = normalize(prev_thr_r, CAP_THROTTLE)
+    obs[Inp.steering_prev]       = normalize_signed(prev_steer_deg, CAP_STEERING)
+    obs[Inp.angle_left]          = encode_angle(clamp_angle_for_model(geom.angle_left))
+    obs[Inp.angle_right]         = encode_angle(clamp_angle_for_model(geom.angle_right))
+    # Spec: yaw_rate input uses -GyroZ so + = right turn (matches steering).
+    obs[Inp.yaw_rate]            = normalize_signed(-raw_gyro_z, CAP_YAW)
+    obs[Inp.accel_lat]           = normalize_signed(raw_accel_x, CAP_ACCEL)
+    obs[Inp.accel_long]          = normalize_signed(raw_accel_y, CAP_ACCEL)
+    return obs
 
 
 class RobotEnv(gym.Env):
-    """Single-robot gymnasium env. Use gymnasium.make_vec_env with
-    SubprocVecEnv to run N of these in parallel for RL training."""
+    """Single-robot env. Observation is the 13-input model vector; action is
+    the 3-output residual delta. Use SubprocVecEnv to run N in parallel."""
 
     metadata = {"render_modes": ["human", "rgb_array"]}
 
@@ -48,10 +117,9 @@ class RobotEnv(gym.Env):
         self,
         render_mode: Optional[str] = None,
         dt_ms: float = 1.0,
-        ctrl_period_ms: float = 80.0,
+        ctrl_period_ms: float = 80.0,   # ~12.5 Hz, matches firmware
         calibration: CalibrationArg = None,
-        controller: Optional[AbstractController] = None,
-        max_episode_steps: int = 2000,
+        max_episode_steps: int = 1500,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
@@ -60,50 +128,38 @@ class RobotEnv(gym.Env):
         self._max_episode_steps = max_episode_steps
 
         self.set_calibration(calibration)
-        self._controller = controller
 
         self._world = build_default_world()
         self._walls = self._world["walls"]
         self._state: Optional[RobotState] = None
         self._t_ms: float = 0.0
         self._step_count: int = 0
-        # Lap-progress tracker: cumulative unwrapped angle around the track
-        # centroid. Reward is proportional to Δangle per step, so one full
-        # lap (2π rad of progress) contributes a big positive return.
+
+        self._pd = PDBaseline()
+        self._imu = IMUSimulator()
+
+        # Per-spec initial conditions (sec 7): throttles 0, steering centered.
+        self._prev_thr_l: float = 0.0
+        self._prev_thr_r: float = 0.0
+        self._prev_steer_deg: float = 0.0
+
+        # Lap-progress reward state — direction-agnostic, see _reward.
         self._track_center: Optional[tuple[float, float]] = None
         self._prev_angle: float = 0.0
         self._lap_progress: float = 0.0
-        # Episode-sticky driving direction (+1 = CCW, -1 = CW, 0 = not yet
-        # decided). The car's own first decisive motion picks it, so the
-        # policy can settle into either lap direction per episode instead
-        # of being forced CCW by the reward. Prevents oscillation hacks
-        # because reversing flips lap reward negative.
         self._ep_direction: int = 0
 
-        # Observation: 5 sensor distances (normalized 0..1) + v, omega, steer.
+        # Observation: 13 features in [0, 1]. Action: 3 deltas in [-1, +1].
         self.observation_space = gym.spaces.Box(
-            low=np.array([0, 0, 0, 0, 0, -1, -1, -1], dtype=np.float32),
-            high=np.array([1, 1, 1, 1, 1, +1, +1, +1], dtype=np.float32),
-            dtype=np.float32,
+            low=0.0, high=1.0, shape=(NUM_INPUTS,), dtype=np.float32,
         )
-        # Action: [servo_norm, throttle_L_norm, throttle_R_norm], all ∈ [-1, +1].
-        # Two throttles because the real robot is differential-drive (firmware's
-        # CAN_SetMotors takes throttle_l, throttle_r, steering independently —
-        # it slows the inside wheel on sharp turns). Each throttle is remapped
-        # to [THROTTLE_MIN, 1.0] inside step() so the Gaussian action dist
-        # (which centers at 0) starts at ~0.5 duty and always keeps the robot
-        # moving (avoids the 0-gradient failure mode).
         self.action_space = gym.spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([+1.0, +1.0, +1.0], dtype=np.float32),
-            dtype=np.float32,
+            low=-1.0, high=1.0, shape=(NUM_OUTPUTS,), dtype=np.float32,
         )
 
     # ---- Calibration API --------------------------------------------------
 
     def set_calibration(self, cal: CalibrationArg) -> None:
-        """Hot-swap calibration. Pass a SensorCalibration, a YAML path, or
-        None to reload the default YAML."""
         if cal is None:
             self.calibration = SensorCalibration.default()
         elif isinstance(cal, SensorCalibration):
@@ -121,32 +177,106 @@ class RobotEnv(gym.Env):
         if options and "spawn" in options:
             spawn.update(options["spawn"])
         else:
-            # Jitter spawn so the policy doesn't memorize one pose, and
-            # coin-flip the heading so half of episodes face CW and half
-            # CCW. In real life a car drives the way it's placed; we want
-            # training to cover both placements so the policy generalizes.
             rng = self.np_random
             spawn["x"] += float(rng.uniform(-30.0, 30.0))
             spawn["y"] += float(rng.uniform(-6.0, 6.0))
             base_theta = spawn.get("theta", 0.0)
             if rng.random() < 0.5:
-                base_theta += float(np.pi)        # flip 180° → opposite lap dir
+                base_theta += float(np.pi)
             spawn["theta"] = base_theta + float(rng.uniform(-0.5, 0.5))
+
         self._state = initial_robot(spawn["x"], spawn["y"], spawn.get("theta", 0.0))
         self._t_ms = 0.0
         self._step_count = 0
+
+        self._pd.reset()
+        self._imu.reset(v_cms=0.0, t_s=0.0)
+
+        self._prev_thr_l = 0.0
+        self._prev_thr_r = 0.0
+        self._prev_steer_deg = 0.0
+
         self._lap_progress = 0.0
         self._ep_direction = 0
         self._track_center = self._compute_track_center()
-        self._prev_angle = self._angle_from_center(self._state.pose.x,
-                                                   self._state.pose.y)
-        if self._controller is not None:
-            self._controller.reset()
+        self._prev_angle = self._angle_from_center(self._state.pose.x, self._state.pose.y)
+
         sensors = self._sample()
-        return self._obs(sensors), {}
+        # IMU at rest at t=0 reads zeros; matches firmware boot.
+        obs = build_observation(
+            sensors, 0, 0, 0,
+            self._prev_thr_l, self._prev_thr_r, self._prev_steer_deg,
+        )
+        return obs, {}
+
+    def step(self, action):
+        assert self._state is not None, "call reset() before step()"
+
+        sensors = self._sample()
+        d_ir, ld_ir, d2, ld2, front = sensors_to_mm(sensors)
+        d_ir, ld_ir = ir_correction(d_ir, ld_ir, d2, ld2)
+        geom = compute_geometry(d_ir, ld_ir, d2, ld2, front)
+        pd = self._pd.tick(geom)
+
+        delta_thr_l, delta_thr_r, delta_steer = action_to_delta(np.asarray(action))
+        thr_l, thr_r, steer_deg = apply_residual(
+            pd.throttle_l, pd.throttle_r, pd.steering,
+            delta_thr_l, delta_thr_r, delta_steer,
+        )
+
+        # Convert to physics command. Throttle is already in PWM units that
+        # map directly to the firmware's CAN_SetMotors duty (CAP_THROTTLE=9000
+        # < MOTOR_PWM_MAX_COUNT=10000).
+        servo = steer_deg_to_servo_count(steer_deg)
+        apply_command(self._state, int(thr_l), int(thr_r), servo)
+
+        for _ in range(self._ctrl_steps):
+            step_physics(self._state, self._walls,
+                         CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM, self._dt)
+            self._t_ms += self._dt * 1000.0
+            if self._state.collided:
+                break
+
+        self._prev_thr_l = thr_l
+        self._prev_thr_r = thr_r
+        self._prev_steer_deg = steer_deg
+
+        raw_gyro_z, raw_accel_x, raw_accel_y = self._imu.read(self._state, self._t_ms / 1000.0)
+        next_sensors = self._sample()
+        obs = build_observation(
+            next_sensors, raw_gyro_z, raw_accel_x, raw_accel_y,
+            self._prev_thr_l, self._prev_thr_r, self._prev_steer_deg,
+        )
+
+        reward = self._reward(next_sensors, action)
+        terminated = self._state.collided
+        self._step_count += 1
+        truncated = self._step_count >= self._max_episode_steps
+        info = {
+            "t_ms": self._t_ms,
+            "pose": (self._state.pose.x, self._state.pose.y, self._state.pose.theta),
+            "v": self._state.v,
+            "collided": self._state.collided,
+            "sensors": next_sensors,
+            "pd": {"throttle_l": pd.throttle_l, "throttle_r": pd.throttle_r,
+                   "steering": pd.steering},
+            "applied": {"throttle_l": thr_l, "throttle_r": thr_r,
+                        "steering": steer_deg},
+        }
+        return obs, reward, terminated, truncated, info
+
+    def render(self):
+        return None
+
+    def close(self):
+        pass
+
+    # ---- Internals --------------------------------------------------------
+
+    def _sample(self) -> dict:
+        return sample_sensors(self._walls, self._state.pose, self.calibration)
 
     def _compute_track_center(self) -> tuple[float, float]:
-        """Centroid of the world bounds. Works for any closed track."""
         b = self._world.get("bounds", {})
         if not b:
             return (0.0, 0.0)
@@ -157,122 +287,34 @@ class RobotEnv(gym.Env):
         cx, cy = self._track_center or (0.0, 0.0)
         return float(np.arctan2(y - cy, x - cx))
 
-    def step(self, action):
-        assert self._state is not None, "call reset() before step()"
-        if self._controller is not None:
-            sensors = self._sample()
-            cmd = self._controller.tick(sensors, self._t_ms)
-            apply_command(self._state, cmd.duty_l, cmd.duty_r, cmd.servo,
-                          cmd.dir_l, cmd.dir_r)
-        else:
-            servo_norm = float(np.clip(action[0], -1.0, 1.0))
-            tL_norm   = float(np.clip(action[1], -1.0, 1.0))
-            tR_norm   = float(np.clip(action[2], -1.0, 1.0))
-            # Remap [-1, +1] → [THROTTLE_MIN, 1.0] per wheel.
-            throttle_l = THROTTLE_MIN + (tL_norm + 1.0) * 0.5 * (1.0 - THROTTLE_MIN)
-            throttle_r = THROTTLE_MIN + (tR_norm + 1.0) * 0.5 * (1.0 - THROTTLE_MIN)
-            if servo_norm >= 0:
-                servo = int(SERVO_CENTER_COUNT + servo_norm * (SERVO_MAX_COUNT - SERVO_CENTER_COUNT))
-            else:
-                servo = int(SERVO_CENTER_COUNT + servo_norm * (SERVO_CENTER_COUNT - SERVO_MIN_COUNT))
-            duty_l = int(throttle_l * MOTOR_PWM_MAX_COUNT)
-            duty_r = int(throttle_r * MOTOR_PWM_MAX_COUNT)
-            apply_command(self._state, duty_l, duty_r, servo)
+    def _reward(self, sensors: dict, action) -> float:
+        """Direction-agnostic lap reward + small L2 penalty on the residual.
 
-        for _ in range(self._ctrl_steps):
-            step_physics(self._state, self._walls,
-                         CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM, self._dt)
-            self._t_ms += self._dt * 1000.0
-            if self._state.collided:
-                break
-
-        sensors = self._sample()
-        obs = self._obs(sensors)
-        reward = self._reward(sensors)
-        terminated = self._state.collided
-        self._step_count += 1
-        truncated = self._step_count >= self._max_episode_steps
-        info = {
-            "t_ms": self._t_ms,
-            "pose": (self._state.pose.x, self._state.pose.y, self._state.pose.theta),
-            "v": self._state.v,
-            "collided": self._state.collided,
-            "sensors": sensors,
-        }
-        return obs, reward, terminated, truncated, info
-
-    def render(self):
-        # Lightweight inspection hook; a pygame/matplotlib renderer can consume
-        # the state externally. Left as a no-op so headless training is cheap.
-        return None
-
-    def close(self):
-        if self._controller is not None:
-            self._controller.close()
-
-    # ---- Internals --------------------------------------------------------
-
-    def _sample(self) -> dict:
-        return sample_sensors(self._walls, self._state.pose, self.calibration)
-
-    def _obs(self, sensors: dict) -> np.ndarray:
-        lidar_max = self.calibration.lidar.max_cm
-        ir_max = self.calibration.ir.max_cm
-        lc = sensors["lidar"]["center"]["distance_cm"] / lidar_max
-        ll = sensors["lidar"]["left"]["distance_cm"] / lidar_max
-        lr = sensors["lidar"]["right"]["distance_cm"] / lidar_max
-        il = sensors["ir"]["left"]["distance_cm"] / ir_max
-        ir = sensors["ir"]["right"]["distance_cm"] / ir_max
-        v = self._state.v / MAX_SPEED_CMS
-        omega = np.clip(self._state.omega / 5.0, -1.0, 1.0)
-        steer = self._state.steer_angle / STEER_LIMIT_RAD
-        return np.array([lc, ll, lr, il, ir, v, omega, steer], dtype=np.float32)
-
-    def _reward(self, sensors: dict) -> float:
-        """Controller-agnostic racing reward — direction-agnostic. Does NOT
-        target any specific wall-distance setpoint so it stays swappable
-        with any controller (firmware PD, learned residual, etc.).
-
-        Importance ordering (crash >> laps > speed > proximity > smoothness):
-          crash       : -100  (one-shot terminal)
-          laps        : +20 per full lap (linear on Δangle, signed vs chosen dir)
-          speed       : up to +0.2/tick, only while progressing in chosen dir
-          proximity   : up to -0.05/tick inside 10 cm, floor at 3 cm
-          smoothness  : up to -0.01/tick for hard steering
-        Over a 1500-tick (~120 s) episode this caps near-best total at
-        ~+400 (several laps at full speed) and worst at ~-100 (crash)."""
+        Lap progress: signed Δangle around the track centroid; episode picks
+        its own direction on first decisive motion. Speed bonus only while
+        progressing in the chosen direction. Crash terminates with -100.
+        Action L2 penalty discourages large residuals — matches spec section 9.
+        """
         if self._state.collided:
             return -100.0
 
-        # ---- Lap progress (signed Δangle around track center) ------------
-        cur_angle = self._angle_from_center(self._state.pose.x,
-                                            self._state.pose.y)
+        cur_angle = self._angle_from_center(self._state.pose.x, self._state.pose.y)
         d_angle = cur_angle - self._prev_angle
         if d_angle >  np.pi: d_angle -= 2 * np.pi
         if d_angle < -np.pi: d_angle += 2 * np.pi
         self._prev_angle = cur_angle
         self._lap_progress += d_angle
 
-        # Episode direction: the car's first decisive motion picks CCW (+1)
-        # or CW (-1). Once set, lap reward is signed against that choice,
-        # so reversing *loses* accumulated reward. Works in either direction
-        # without biasing the policy — cars in ghost mode (or just separate
-        # envs) will split into ~half CCW / half CW naturally.
         if self._ep_direction == 0 and abs(self._lap_progress) > 0.05:
             self._ep_direction = 1 if self._lap_progress > 0 else -1
-        direction = self._ep_direction or 1  # default CCW until decided
+        direction = self._ep_direction or 1
 
-        # +20 per full lap (2π rad) in the chosen direction.
         lap_r = float(d_angle) * direction * (20.0 / (2.0 * np.pi))
 
-        # ---- Speed bonus (gated on progressing in chosen direction) ------
-        # No "sprint backwards" loophole: oscillation won't earn speed_r
-        # because d_angle * direction flips sign each reversal.
         speed_frac = max(0.0, self._state.v) / MAX_SPEED_CMS
         progressing = 1.0 if d_angle * direction > 0 else 0.0
         speed_r = 0.2 * speed_frac * progressing
 
-        # ---- Proximity safety (bounded well below crash) -----------------
         min_dist = min(
             sensors["lidar"]["center"]["distance_cm"],
             sensors["lidar"]["left"]["distance_cm"],
@@ -282,12 +324,9 @@ class RobotEnv(gym.Env):
             sensors["ir"]["right"]["distance_cm"]
                 if sensors["ir"]["right"]["valid"] else 99.0,
         )
-        if min_dist < 10.0:
-            proximity_pen = (10.0 - max(3.0, min_dist)) * 0.05  # max ~0.35/tick
-        else:
-            proximity_pen = 0.0
+        proximity_pen = (10.0 - max(3.0, min_dist)) * 0.05 if min_dist < 10.0 else 0.0
 
-        # ---- Steering smoothness — gentle, just to discourage chatter ----
-        steer_pen = 0.01 * (self._state.steer_angle / STEER_LIMIT_RAD) ** 2
+        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        action_pen = ACTION_L2_PENALTY * float(np.dot(a, a)) / NUM_OUTPUTS
 
-        return lap_r + speed_r - proximity_pen - steer_pen
+        return lap_r + speed_r - proximity_pen - action_pen

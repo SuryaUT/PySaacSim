@@ -1,33 +1,31 @@
-"""Linear policy helpers for SB3 PPO with `net_arch=[]`.
+"""Linear policy helpers for SB3 PPO with `net_arch=[]` — residual policy.
 
-With net_arch=[], the policy becomes:
+With `net_arch=[]`, the SB3 MLP collapses to a 13→3 affine map:
     action = W @ obs + b
-(plus a stochastic term during training; deterministic at rollout time).
-
-Feature layout matches PySaacSim.env.RobotEnv.observation_space:
-    [lidar_c, lidar_l, lidar_r, ir_l, ir_r, v, omega, steer]   (8 features)
-Action layout:
-    [servo_norm, throttle_L_norm, throttle_R_norm] all ∈ [-1,1]  (3 actions)
-Each throttle is remapped by the env to [THROTTLE_MIN, 1.0]. Two
-throttles match the firmware's differential-drive CAN_SetMotors
-(separate duty for left and right rear wheels).
+where action is the residual delta in normalized [-1, +1] space (action 0
+⇒ pure PD baseline). Names below match the spec's input_t / output_t
+enums in Model.h.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 
+from ...sim.model import (
+    INPUT_NAMES, OUTPUT_NAMES, NUM_INPUTS, NUM_OUTPUTS, export_q16,
+    export_to_c_source,
+)
 
-FEATURE_NAMES = ["lidar_c", "lidar_l", "lidar_r", "ir_l", "ir_r",
-                 "v", "omega", "steer"]
-ACTION_NAMES = ["servo", "throttle_L", "throttle_R"]
+
+# Re-exported under the GUI-friendly names so existing widgets (heatmap labels)
+# don't need to know about sim.model.
+FEATURE_NAMES = INPUT_NAMES   # 13 inputs in input_t order
+ACTION_NAMES = OUTPUT_NAMES   # 3 deltas in output_t order
 
 
 def extract_weights(model) -> tuple[np.ndarray, np.ndarray]:
     """Pull the linear policy (W, b) out of a trained SB3 PPO model.
 
-    Returns W shape (action_dim, obs_dim) and b shape (action_dim,)."""
+    Returns W shape (NUM_OUTPUTS, NUM_INPUTS) and b shape (NUM_OUTPUTS,)."""
     action_net = model.policy.action_net
     W = action_net.weight.detach().cpu().numpy().copy()
     b = action_net.bias.detach().cpu().numpy().copy()
@@ -35,11 +33,22 @@ def extract_weights(model) -> tuple[np.ndarray, np.ndarray]:
 
 
 def policy_forward(W: np.ndarray, b: np.ndarray, obs: np.ndarray) -> np.ndarray:
-    """Deterministic forward pass. obs shape (8,) -> action shape (3,).
+    """Deterministic forward pass. obs shape (13,) -> action shape (3,) in [-1, +1].
 
-    [servo_norm, tL_norm, tR_norm], all clipped to [-1, +1]. The env remaps
-    each throttle → [THROTTLE_MIN, 1.0]."""
+    Output components are the residual deltas in normalized space:
+      [throttle_left_delta, throttle_right_delta, steering_delta]
+    Each ±1 maps to ±CAP_DELTA_* in the env (see sim.model.action_to_delta)."""
     a = W @ obs + b
-    for i in range(a.shape[0]):
-        a[i] = max(-1.0, min(1.0, a[i]))
-    return a
+    return np.clip(a, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def export_firmware(W: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
+    """Quantize a trained linear policy and emit a Model.c initializer block.
+
+    Returns (Wq, bq, c_source). Drop `c_source` into the firmware's Model.c
+    in place of the existing `Model_Weights` / `Model_Bias` arrays.
+    """
+    if W.shape != (NUM_OUTPUTS, NUM_INPUTS):
+        raise ValueError(f"W shape {W.shape} != ({NUM_OUTPUTS}, {NUM_INPUTS})")
+    Wq, bq = export_q16(W, b)
+    return Wq, bq, export_to_c_source(Wq, bq)
