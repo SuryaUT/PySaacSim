@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PysaacRC</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- header / tab bar -->
+  <div id="header">
+    <h1>PysaacRC</h1>
+    <button class="tab-btn active" id="tab-sim"    onclick="setTab('sim')">Sim ▶</button>
+    <button class="tab-btn"        id="tab-train"  onclick="setTab('train')">Train ▶</button>
+    <button class="tab-btn"        id="tab-controller" onclick="setTab('controller')">Controller ⚙</button>
+    <span id="status-dot" title="WS status"></span>
+    <span id="status-label">disconnected</span>
+  </div>
+
+  <!-- main split: canvas | train | controller panel -->
+  <div id="main">
+    <!-- Sim canvas -->
+    <div id="sim-panel">
+      <div id="sim-canvas-wrap">
+        <canvas id="sim-canvas"></canvas>
+      </div>
+      <div id="sim-controls">
+        <span class="ctrl-label">WASD/arrows: drive</span>
+        <span class="ctrl-label" style="margin-left:auto">v</span>
+        <span class="ctrl-val" id="ctrl-v">—</span>
+        <span class="ctrl-label">steer</span>
+        <span class="ctrl-val" id="ctrl-steer">—</span>
+        <span class="ctrl-label" id="sim-collided" style="color:var(--red);display:none">COLLISION</span>
+      </div>
+    </div>
+
+    <!-- Training panel -->
+    <div id="train-panel" class="hidden">
+      <div id="train-form">
+        <div class="form-row">
+          <label>Track ID</label>
+          <input id="f-track-id" type="text" placeholder="paste track ID…" />
+        </div>
+        <div class="form-row">
+          <label>Minutes (1–10)</label>
+          <input id="f-minutes" type="number" value="3" min="1" max="10" />
+        </div>
+        <div class="form-row">
+          <label>Parallel envs</label>
+          <input id="f-n-envs" type="number" value="8" min="1" max="16" />
+        </div>
+        <div class="form-row">
+          <label>Learning rate</label>
+          <input id="f-lr" type="number" value="0.0003" step="0.0001" />
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-start" onclick="startJob()">Start</button>
+          <button class="btn danger"  id="btn-stop"  onclick="cancelJob()" disabled>Cancel</button>
+          <button class="btn"         id="btn-load-policy" onclick="loadPolicyIntoSim()" disabled>Load policy →</button>
+        </div>
+      </div>
+
+      <div id="reward-chart-wrap" style="height:140px">
+        <canvas id="reward-chart" style="width:100%;height:124px"></canvas>
+      </div>
+
+      <div id="train-stats">
+        <div class="stat"><span>Step</span><span id="ts-step">—</span></div>
+        <div class="stat"><span>Mean reward</span><span id="ts-reward">—</span></div>
+        <div class="stat"><span>FPS</span><span id="ts-fps">—</span></div>
+        <div class="stat"><span>State</span><span id="ts-state">—</span></div>
+      </div>
+
+      <div id="eval-card">
+        <h3>Eval result</h3>
+        <pre id="eval-pre"></pre>
+      </div>
+    </div>
+
+    <!-- Controller Editor panel -->
+    <div id="controller-panel" class="hidden" style="flex:1; display:flex; flex-direction:column; background:var(--bg); border-left:1px solid var(--border);">
+      <div style="display:flex; justify-content:flex-start; gap: 8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--border);">
+        <input type="text" id="ctrl-name" value="my_ctrl" style="background:#222; color:var(--text); border:1px solid var(--border); padding:4px 8px; border-radius:4px; font-family:var(--font);" />
+        <button class="btn primary" onclick="compileController()">Compile & Run</button>
+        <button class="btn danger" onclick="stopController()">Stop</button>
+      </div>
+      <textarea id="ctrl-editor" style="flex:1; width:100%; background:var(--bg); color:var(--text); font-family:var(--font); padding:12px; border:none; resize:none; outline:none;" spellcheck="false">
+#include "hal.h"
+#include <stdint.h>
+#include <math.h>
+
+void robot_init(void) {
+      // init logic
+}
+
+void robot_tick(void) {
+      CAN_SetMotors(5000, 5000, 3000);
+}
+</textarea>
+    </div>
+
+  </div> <!-- end main div -->
+
+  <!-- log strip -->
+  <div id="log-panel">
+    <div id="log-header" onclick="toggleLog()">▸ Log</div>
+    <div id="log-body"></div>
+  </div>
+
+</div>
+
+<script src="sim.js?v=2"></script>
+<script src="training.js?v=2"></script>
+<script>
+  function setTab(tab) {
+    document.getElementById('tab-sim').classList.toggle('active', tab === 'sim');
+    document.getElementById('tab-train').classList.toggle('active', tab === 'train');
+    document.getElementById('tab-controller').classList.toggle('active', tab === 'controller');
+    
+    // Hide #sim-panel too unless we are strictly on sim or train (train shows both)
+    if (tab === 'controller') {
+        document.getElementById('sim-panel').style.display = 'none';
+        document.getElementById('train-panel').classList.add('hidden');
+        document.getElementById('controller-panel').classList.remove('hidden');
+    } else if (tab === 'train') {
+        document.getElementById('sim-panel').style.display = 'flex';
+        document.getElementById('train-panel').classList.remove('hidden');
+        document.getElementById('controller-panel').classList.add('hidden');
+    } else {
+        document.getElementById('sim-panel').style.display = 'flex';
+        document.getElementById('train-panel').classList.add('hidden');
+        document.getElementById('controller-panel').classList.add('hidden');
+    }
+  }
+
+  function log(msg, cls='') {
+    const p = document.createElement('p');
+    if (cls) p.className = cls;
+    p.textContent = new Date().toTimeString().slice(0,8) + '  ' + msg;
+    const body = document.getElementById('log-body');
+    body.appendChild(p);
+    body.scrollTop = body.scrollHeight;
+    while (body.children.length > 300) body.removeChild(body.firstChild);
+  }
+
+  function setConnected(ok) {
+    const d = document.getElementById('status-dot');
+    const l = document.getElementById('status-label');
+    d.className = ok ? 'connected' : '';
+    l.textContent = ok ? 'connected' : 'disconnected';
+  }
+
+  function toggleLog() {
+    document.getElementById('log-panel').classList.toggle('expanded');
+    document.getElementById('log-header').textContent =
+      document.getElementById('log-panel').classList.contains('expanded') ? '▾ Log' : '▸ Log';
+  }
+
+  window.pysaac = { log, setConnected };
+
+  async function compileController() {
+      const name = document.getElementById('ctrl-name').value;
+      const code = document.getElementById('ctrl-editor').value;
+      const jwt = sessionStorage.getItem('pysaac_jwt');
+      if (!jwt) { log("No JWT, please login.", "err"); return; }
+      log(`Compiling controller '${name}'...`);
+      try {
+          const res = await fetch("/gui/compile_controller", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${jwt}` },
+              body: JSON.stringify({ name, code })
+          });
+          const data = await res.json();
+          if (data.status === "ok") {
+              log(`Controller '${name}' running!`, "connected");
+              setTab("sim");
+          } else {
+              log(`Compilation failed: ${data.error}`, "err");
+          }
+      } catch (e) {
+          log(`Error: ${e}`, "err");
+      }
+  }
+  async function stopController() {
+      const jwt = sessionStorage.getItem('pysaac_jwt');
+      if (!jwt) return;
+      try {
+          await fetch("/gui/stop_controller", { method: "POST", headers: { "Authorization": `Bearer ${jwt}` } });
+          log("C controller stopped.");
+      } catch(e) {}
+  }
+</script>
+</body>
+</html>
