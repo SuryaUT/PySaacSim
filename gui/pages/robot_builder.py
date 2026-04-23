@@ -259,7 +259,7 @@ class RobotBuilderPage(QWidget):
             ("v_clamp", "v_clamp"),
             ("min_cm", "min_cm"),
             ("max_cm", "max_cm"),
-            ("distance_noise_std_cm", "noise (cm)"),
+            ("adc_noise_std", "noise (ADC counts)"),
             ("voltage_noise_std", "noise (V)"),
         ]:
             s = self._spin(getattr(ir, attr), -100, 10000, 0.01,

@@ -1,0 +1,66 @@
+ir:
+  curve_k: 10.7489
+  curve_c: -2.776
+  floor_v: 0.7879
+  peak_cm: 4.0
+  peak_floor_v: 0.4
+  v_clamp: 3.1
+  min_cm: 4.0
+  max_cm: 30.5
+  voltage_noise_std: 0.02
+  adc_noise_std: 5.76646729229793
+  adc_max_count: 4095
+  adc_vref: 3.3
+  left:
+    a: 83326.42056584713
+    b: -497.6065058553148
+    c: 18.261667887965352
+    adc_threshold: 790
+  right:
+    a: 76921.03097183381
+    b: -494.77256553555077
+    c: 20.310107914349945
+    adc_threshold: 765
+  sat_mm: 305.0
+lidar:
+  max_cm: 100.0
+  noise_std_cm: 0.14644058294648338
+  fov_rad: 0.0349
+  rate_hz: 100.0
+  distance_scale: 1.0
+  distance_bias_cm: 0.0
+imu:
+  dlpf_fc_hz: 44.0
+  avg_samples: 4
+  gyro_noise_lsb: 13.424897648958808
+  accel_noise_lsb: 45.797650727443525
+  gyro_bias:
+  - 0
+  - 0
+  - 46
+  accel_bias:
+  - 264
+  - -1074
+  - 0
+lidar_placements:
+- id: tfluna_center
+  x: 14.75
+  y: 0.0
+  theta: 0.0
+- id: tfluna_left
+  x: 13.75
+  y: 7.5
+  theta: 0.7854
+- id: tfluna_right
+  x: 13.75
+  y: -7.5
+  theta: -0.7854
+ir_placements:
+- id: ir_left
+  x: -2.95
+  y: 8.5
+  theta: 1.5708
+- id: ir_right
+  x: -2.95
+  y: -8.5
+  theta: -1.5708

@@ -1,0 +1,14 @@
+  imu.accel_bias: [0, 0, 0]  ->  [264, -1074, 0]
+  imu.accel_noise_lsb: 0.0  ->  45.797650727443525
+  imu.gyro_bias: [0, 0, 0]  ->  [0, 0, 46]
+  imu.gyro_noise_lsb: 0.0  ->  13.424897648958808
+  ir.adc_noise_std: 0.0  ->  5.76646729229793
+  ir.left.a: 137932  ->  83326.42056584713
+  ir.left.adc_threshold: 1376  ->  790
+  ir.left.b: -859  ->  -497.6065058553148
+  ir.left.c: 32  ->  18.261667887965352
+  ir.right.a: 52850  ->  76921.03097183381
+  ir.right.adc_threshold: 1476  ->  765
+  ir.right.b: -1239  ->  -494.77256553555077
+  ir.right.c: 69  ->  20.310107914349945
+  lidar.noise_std_cm: 0.056  ->  0.14644058294648338

@@ -25,23 +25,26 @@ REAR_TRACK_CM = 18.0           # measured
 
 
 # -- Steering (MG996R) ------------------------------------------------------
-# Measured PWM endpoints on the physical robot:
-#   2000 = full left (+53° in CCW-positive yaw convention)
-#   3200 = center
-#   4400 = full right (-53°)
+# Firmware servo formula (RTOS_MotorBoard/bump.c): count = 3120 + angle*1200/53.
+# Endpoints derived from that formula (angle in deg, positive = right turn):
+#   1920 = full right (+53°, firmware sign) -> -53° in sim's CCW-positive frame
+#   3120 = center
+#   4320 = full left  (-53°, firmware sign) -> +53° in sim's CCW-positive frame
 SERVO_TIMER_HZ = 2_000_000
-SERVO_MIN_COUNT = 2000
-SERVO_CENTER_COUNT = 3200
-SERVO_MAX_COUNT = 4400
+SERVO_CENTER_COUNT = 3120
+SERVO_COUNTS_PER_53DEG = 1200
+SERVO_MIN_COUNT = SERVO_CENTER_COUNT - SERVO_COUNTS_PER_53DEG  # 1920
+SERVO_MAX_COUNT = SERVO_CENTER_COUNT + SERVO_COUNTS_PER_53DEG  # 4320
 STEER_LIMIT_RAD = math.radians(53)
 SERVO_RAD_PER_SEC = math.radians(60) / 0.17
 
 
 def servo_count_to_steer_angle(count: int) -> float:
-    """Servo PWM count (2000..4000) -> wheel angle (rad). Right turn is negative
-    (CCW-positive yaw convention in sim, matching firmware's sign convention)."""
+    """Servo PWM count -> wheel angle (rad). Firmware uses
+    count = 3120 + angle_deg*1200/53, positive = right turn; sim's yaw frame is
+    CCW-positive, so right turn -> negative wheel angle."""
     c = max(SERVO_MIN_COUNT, min(SERVO_MAX_COUNT, count))
-    t = (c - SERVO_CENTER_COUNT) / (SERVO_MAX_COUNT - SERVO_CENTER_COUNT)
+    t = (c - SERVO_CENTER_COUNT) / SERVO_COUNTS_PER_53DEG
     return -t * STEER_LIMIT_RAD
 
 
@@ -51,8 +54,19 @@ MOTOR_PWM_HZ = 200
 MOTOR_MAX_FORCE_N = 5.0
 MOTOR_LAG_TAU_S = 0.100
 
-# Top speed governor: measured 0.47 m/s at 9000/10000 duty on the real robot.
-MAX_SPEED_CMS = 47
+# Top speed: measured 1.219 m/s at full charge on the real robot
+# (2026-04-22, smooth lab tile). Supersedes the earlier 0.47 m/s figure.
+# NOTE: This value is no longer enforced as a hard clamp by physics.py —
+# terminal velocity emerges from MOTOR_MAX_FORCE_N vs LINEAR_DRAG balance.
+# Kept here for reference and as a sanity-check ceiling in tests / fit bounds.
+MAX_SPEED_CMS = 122
+
+# Actuator transport delay between firmware command (sent over CAN) and the
+# motor/servo physically responding. Decomposition: CAN serialization (~5-10
+# ms), motor-board ISR + PWM register write (~1-5 ms), 50 Hz servo PWM cycle
+# wait (0-20 ms), servo internal deadband (5-15 ms). Both fitted by CMA-ES.
+STEER_TRANSPORT_LAG_S = 0.030
+THROTTLE_TRANSPORT_LAG_S = 0.030
 
 
 def duty_count_to_pwm01(count: int) -> float:

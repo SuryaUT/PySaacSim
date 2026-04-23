@@ -1,12 +1,12 @@
-"""Same-scene multi-agent training env.
+"""Same-scene multi-agent training env (residual-on-PD architecture).
 
-N robots share one track. Each robot's sensors see other robots' chassis
-edges as obstacles and physics treats them as collidable walls. All N
-agents feed experience into a single PPO model (Isaac-Sim-style).
+N robots share one track. Each robot runs its own PD baseline + IMU state +
+residual policy. Each robot's sensors see other robots' chassis edges as
+obstacles and physics treats them as collidable walls.
 
 Exposes the stable_baselines3 VecEnv interface so PPO can drive it directly:
-    reset()  -> obs shape (N, obs_dim)
-    step(actions)  -> obs (N, obs_dim), rewards (N,), dones (N,), infos [N]
+    reset()            -> obs (N, 13)
+    step(actions)      -> obs (N, 13), rewards (N,), dones (N,), infos [N]
 
 Auto-reset policy: when any agent terminates (collision) or truncates
 (max steps), it is reset to its spawn pose at the start of the next step.
@@ -22,17 +22,21 @@ import gymnasium as gym
 import numpy as np
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
+from ..control.pd_baseline import PDBaseline, compute_geometry, ir_correction
 from ..sim.calibration import SensorCalibration
 from ..sim.constants import (
-    CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM, MAX_SPEED_CMS, MOTOR_PWM_MAX_COUNT,
-    PHYSICS_DT_S, SERVO_CENTER_COUNT, SERVO_MAX_COUNT, SERVO_MIN_COUNT,
-    STEER_LIMIT_RAD,
+    CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM, MAX_SPEED_CMS,
 )
 from ..sim.geometry import Segment, chassis_segments
+from ..sim.imu import IMUSimulator
+from ..sim.model import NUM_INPUTS, NUM_OUTPUTS, action_to_delta, apply_residual
 from ..sim.physics import RobotState, apply_command, initial_robot, step_physics
 from ..sim.sensors import sample_sensors
 from ..sim.world import DEFAULT_SPAWN, build_default_world
-from .robot_env import THROTTLE_MIN
+from .robot_env import (
+    ACTION_L2_PENALTY, build_observation, ir_reward_component,
+    lidar_proximity_penalty, sensors_to_mm, steer_deg_to_servo_count,
+)
 
 
 CalibrationArg = Union[SensorCalibration, str, Path, None]
@@ -68,8 +72,6 @@ class MultiRobotVecEnv(VecEnv):
         else:
             self._cal = SensorCalibration.default()
 
-        # Evenly stagger spawns around the oval so cars don't start on top
-        # of each other. User can override via `spawns`.
         if spawns is None:
             spawns = self._default_spawns(self._n)
         self._spawns = list(spawns)
@@ -79,22 +81,24 @@ class MultiRobotVecEnv(VecEnv):
             initial_robot(s["x"], s["y"], s.get("theta", 0.0)) for s in self._spawns
         ]
         self._step_counts = [0] * self._n
+        self._t_ms = [0.0] * self._n
+        self._pd: list[PDBaseline] = [PDBaseline() for _ in range(self._n)]
+        self._imu: list[IMUSimulator] = [IMUSimulator() for _ in range(self._n)]
+        self._prev_thr_l = [0.0] * self._n
+        self._prev_thr_r = [0.0] * self._n
+        self._prev_steer_deg = [0.0] * self._n
+
         self._track_center = self._compute_track_center()
         self._prev_angles = [self._angle_from_center(s.pose.x, s.pose.y)
                              for s in self._states]
-        # Per-agent lap progress + sticky episode direction (see RobotEnv).
         self._lap_progress = [0.0] * self._n
         self._ep_direction = [0] * self._n
 
         obs_space = gym.spaces.Box(
-            low=np.array([0, 0, 0, 0, 0, -1, -1, -1], dtype=np.float32),
-            high=np.array([1, 1, 1, 1, 1, +1, +1, +1], dtype=np.float32),
-            dtype=np.float32,
+            low=0.0, high=1.0, shape=(NUM_INPUTS,), dtype=np.float32,
         )
         act_space = gym.spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([+1.0, +1.0, +1.0], dtype=np.float32),
-            dtype=np.float32,
+            low=-1.0, high=1.0, shape=(NUM_OUTPUTS,), dtype=np.float32,
         )
         super().__init__(self._n, obs_space, act_space)
 
@@ -104,8 +108,6 @@ class MultiRobotVecEnv(VecEnv):
 
     @staticmethod
     def _default_spawns(n: int) -> list[dict]:
-        # Strung out along the bottom straight near the default spawn,
-        # spaced 40 cm apart so they fit on a 300+ cm straight.
         base = dict(DEFAULT_SPAWN)
         return [{"x": base["x"] + i * 40.0, "y": base["y"], "theta": 0.0}
                 for i in range(n)]
@@ -132,23 +134,17 @@ class MultiRobotVecEnv(VecEnv):
                 CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM))
         return segs
 
-    def _obs_for(self, i: int, sensors: dict) -> np.ndarray:
-        s = self._states[i]
-        cal = self._cal
-        return np.array([
-            sensors["lidar"]["center"]["distance_cm"] / cal.lidar.max_cm,
-            sensors["lidar"]["left"]["distance_cm"]   / cal.lidar.max_cm,
-            sensors["lidar"]["right"]["distance_cm"]  / cal.lidar.max_cm,
-            sensors["ir"]["left"]["distance_cm"]  / cal.ir.max_cm,
-            sensors["ir"]["right"]["distance_cm"] / cal.ir.max_cm,
-            s.v / MAX_SPEED_CMS,
-            np.clip(s.omega / 5.0, -1.0, 1.0),
-            s.steer_angle / STEER_LIMIT_RAD,
-        ], dtype=np.float32)
+    def _build_obs(self, i: int, sensors: dict) -> np.ndarray:
+        raw_gyro_z, raw_accel_x, raw_accel_y = self._imu[i].read(
+            self._states[i], self._t_ms[i] / 1000.0,
+        )
+        return build_observation(
+            sensors, raw_gyro_z, raw_accel_x, raw_accel_y,
+            self._prev_thr_l[i], self._prev_thr_r[i], self._prev_steer_deg[i],
+        )
 
-    def _reward_for(self, i: int, sensors: dict) -> float:
-        """Controller-agnostic, direction-agnostic racing reward
-        (mirrors RobotEnv._reward; see that file for the rationale)."""
+    def _reward_for(self, i: int, sensors: dict, action: np.ndarray) -> float:
+        """Direction-agnostic lap reward + small L2 penalty (mirrors RobotEnv._reward)."""
         s = self._states[i]
         if s.collided:
             return -100.0
@@ -161,49 +157,48 @@ class MultiRobotVecEnv(VecEnv):
 
         if self._ep_direction[i] == 0 and abs(self._lap_progress[i]) > 0.05:
             self._ep_direction[i] = 1 if self._lap_progress[i] > 0 else -1
-        direction = self._ep_direction[i] or 1
 
-        lap_r = float(d) * direction * (20.0 / (2.0 * np.pi))
+        # Zero lap and speed reward until direction is locked — keeps the
+        # first decisive-motion window fully symmetric between CCW and CW.
+        if self._ep_direction[i] == 0:
+            lap_r = 0.0
+            speed_r = 0.0
+        else:
+            direction = self._ep_direction[i]
+            lap_r = float(d) * direction * (20.0 / (2.0 * np.pi))
+            speed_frac = max(0.0, s.v) / MAX_SPEED_CMS
+            progressing = 1.0 if d * direction > 0 else 0.0
+            speed_r = 0.2 * speed_frac * progressing
 
-        speed_frac = max(0.0, s.v) / MAX_SPEED_CMS
-        progressing = 1.0 if d * direction > 0 else 0.0
-        speed_r = 0.2 * speed_frac * progressing
+        lidar_pen = lidar_proximity_penalty(sensors)
+        ir_r_signed = ir_reward_component(sensors, self._ep_direction[i])
 
-        min_dist = min(
-            sensors["lidar"]["center"]["distance_cm"],
-            sensors["lidar"]["left"]["distance_cm"],
-            sensors["lidar"]["right"]["distance_cm"],
-            sensors["ir"]["left"]["distance_cm"]
-                if sensors["ir"]["left"]["valid"] else 99.0,
-            sensors["ir"]["right"]["distance_cm"]
-                if sensors["ir"]["right"]["valid"] else 99.0,
+        a = np.clip(action.astype(np.float32), -1.0, 1.0)
+        action_pen = ACTION_L2_PENALTY * float(np.dot(a, a)) / NUM_OUTPUTS
+
+        return lap_r + speed_r - lidar_pen + ir_r_signed - action_pen
+
+    def _apply_action(self, i: int, action: np.ndarray, walls: list[Segment]) -> None:
+        sensors = sample_sensors(walls, self._states[i].pose, self._cal)
+        d_ir, ld_ir, d2, ld2, front = sensors_to_mm(sensors)
+        d_ir, ld_ir = ir_correction(d_ir, ld_ir, d2, ld2)
+        geom = compute_geometry(d_ir, ld_ir, d2, ld2, front)
+        pd = self._pd[i].tick(geom)
+
+        delta_thr_l, delta_thr_r, delta_steer = action_to_delta(np.asarray(action))
+        thr_l, thr_r, steer_deg = apply_residual(
+            pd.throttle_l, pd.throttle_r, pd.steering,
+            delta_thr_l, delta_thr_r, delta_steer,
         )
-        if min_dist < 10.0:
-            proximity_pen = (10.0 - max(3.0, min_dist)) * 0.05
-        else:
-            proximity_pen = 0.0
+        servo = steer_deg_to_servo_count(steer_deg)
+        apply_command(self._states[i], int(thr_l), int(thr_r), servo)
 
-        steer_pen = 0.01 * (s.steer_angle / STEER_LIMIT_RAD) ** 2
-        return lap_r + speed_r - proximity_pen - steer_pen
-
-    def _apply_action(self, i: int, action: np.ndarray) -> None:
-        servo_norm = float(np.clip(action[0], -1.0, 1.0))
-        tL_norm   = float(np.clip(action[1], -1.0, 1.0))
-        tR_norm   = float(np.clip(action[2], -1.0, 1.0))
-        throttle_l = THROTTLE_MIN + (tL_norm + 1.0) * 0.5 * (1.0 - THROTTLE_MIN)
-        throttle_r = THROTTLE_MIN + (tR_norm + 1.0) * 0.5 * (1.0 - THROTTLE_MIN)
-        if servo_norm >= 0:
-            servo = int(SERVO_CENTER_COUNT + servo_norm * (SERVO_MAX_COUNT - SERVO_CENTER_COUNT))
-        else:
-            servo = int(SERVO_CENTER_COUNT + servo_norm * (SERVO_CENTER_COUNT - SERVO_MIN_COUNT))
-        duty_l = int(throttle_l * MOTOR_PWM_MAX_COUNT)
-        duty_r = int(throttle_r * MOTOR_PWM_MAX_COUNT)
-        apply_command(self._states[i], duty_l, duty_r, servo)
+        self._prev_thr_l[i] = thr_l
+        self._prev_thr_r[i] = thr_r
+        self._prev_steer_deg[i] = steer_deg
 
     def _reset_one(self, i: int) -> np.ndarray:
         spawn = self._spawns[i]
-        # Jitter around the staggered spawn + 50/50 heading flip so the agent
-        # experiences both CW and CCW starts. See RobotEnv.reset() for rationale.
         jx = spawn["x"] + float(self._rng.uniform(-15.0, 15.0))
         jy = spawn["y"] + float(self._rng.uniform(-6.0, 6.0))
         base_t = spawn.get("theta", 0.0)
@@ -212,12 +207,18 @@ class MultiRobotVecEnv(VecEnv):
         jt = base_t + float(self._rng.uniform(-0.5, 0.5))
         self._states[i] = initial_robot(jx, jy, jt)
         self._step_counts[i] = 0
+        self._t_ms[i] = 0.0
+        self._pd[i].reset()
+        self._imu[i].reset(v_cms=0.0, t_s=0.0)
+        self._prev_thr_l[i] = 0.0
+        self._prev_thr_r[i] = 0.0
+        self._prev_steer_deg[i] = 0.0
         self._prev_angles[i] = self._angle_from_center(jx, jy)
         self._lap_progress[i] = 0.0
         self._ep_direction[i] = 0
         sensors = sample_sensors(self._walls + self._other_segments(i),
                                  self._states[i].pose, self._cal)
-        return self._obs_for(i, sensors)
+        return self._build_obs(i, sensors)
 
     # ---- VecEnv interface -------------------------------------------------
 
@@ -234,24 +235,23 @@ class MultiRobotVecEnv(VecEnv):
 
         # Apply all actions first so cars move "simultaneously" in a tick.
         for i in range(self._n):
-            self._apply_action(i, actions[i])
+            other_segs = self._other_segments(i)
+            self._apply_action(i, actions[i], self._walls + other_segs)
 
         # Step physics for all cars. Walls for car i = static + other cars'
-        # chassis at their CURRENT poses. We use pre-step positions for the
-        # obstacle set; the usual 80 ms control period means cars don't
-        # move more than a few cm per tick, so this is fine.
+        # chassis at their current poses (snapped pre-step).
         for i in range(self._n):
             other_segs = self._other_segments(i)
             eff_walls = self._walls + other_segs
             for _ in range(self._ctrl_steps):
                 step_physics(self._states[i], eff_walls,
                              CHASSIS_LENGTH_CM, CHASSIS_WIDTH_CM, self._dt)
+                self._t_ms[i] += self._dt * 1000.0
                 if self._states[i].collided:
                     break
             self._step_counts[i] += 1
 
-        # Build obs / reward / done per agent.
-        obs = np.zeros((self._n, 8), dtype=np.float32)
+        obs = np.zeros((self._n, NUM_INPUTS), dtype=np.float32)
         rewards = np.zeros(self._n, dtype=np.float32)
         dones = np.zeros(self._n, dtype=bool)
         infos: list[dict] = [{} for _ in range(self._n)]
@@ -259,8 +259,8 @@ class MultiRobotVecEnv(VecEnv):
         for i in range(self._n):
             sensors = sample_sensors(self._walls + self._other_segments(i),
                                      self._states[i].pose, self._cal)
-            obs[i] = self._obs_for(i, sensors)
-            rewards[i] = self._reward_for(i, sensors)
+            obs[i] = self._build_obs(i, sensors)
+            rewards[i] = self._reward_for(i, sensors, actions[i])
             terminated = self._states[i].collided
             truncated = self._step_counts[i] >= self._max_episode_steps
             dones[i] = terminated or truncated
@@ -274,8 +274,7 @@ class MultiRobotVecEnv(VecEnv):
     def close(self) -> None:
         pass
 
-    # SB3 VecEnv plumbing. Return empty/sensible defaults; none of these are
-    # used by PPO's default training loop.
+    # SB3 VecEnv plumbing — none of these are used by PPO's default loop.
     def get_attr(self, attr_name, indices=None):
         indices = self._get_indices(indices)
         return [getattr(self, attr_name, None) for _ in indices]

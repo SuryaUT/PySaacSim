@@ -8,8 +8,8 @@ import random
 from typing import Optional
 
 from .calibration import (
-    IRCalibration, LidarCalibration, SensorCalibration, SensorPlacement,
-    ir_distance_to_volts,
+    IRCalibration, IRSideCalibration, LidarCalibration, SensorCalibration,
+    SensorPlacement, ir_distance_to_volts, ir_firmware_convert,
 )
 from .geometry import Segment, Vec2, body_to_world, cast_ray
 from .physics import Pose
@@ -62,22 +62,39 @@ def lidar_reading(
 
 
 def ir_reading(
-    walls: list[Segment], pose: Pose, placement: SensorPlacement, cal: IRCalibration
+    walls: list[Segment],
+    pose: Pose,
+    placement: SensorPlacement,
+    cal: IRCalibration,
+    side: IRSideCalibration,
 ) -> dict:
+    """Synthesize an IR reading identical in pipeline to the real firmware:
+        true_d → analog volts → ADC quantize (+ noise) → firmware d=a/(adc+b)+c.
+    Output `distance_cm` matches what the CSV log records (mm/10)."""
     # Cast a bit past IR max so we can still simulate out-of-range behavior.
     origin, direction, true_dist, hit_pt = _cast_from(
         walls, pose, placement.x, placement.y, placement.theta, cal.max_cm + 5
     )
-    true_d = true_dist if true_dist is not None else (cal.max_cm + 5)
-    volts = max(0.0, ir_distance_to_volts(true_d, cal) + _gauss(cal.voltage_noise_std))
-    adc = int(round((volts / cal.adc_vref) * cal.adc_max_count)) & 0xFFF
-    reported_d = true_d + _gauss(cal.distance_noise_std_cm)
-    valid = cal.min_cm <= true_d <= cal.max_cm
-    if true_d > cal.max_cm:
-        reported_d = cal.max_cm
+    true_d_cm = true_dist if true_dist is not None else (cal.max_cm + 5)
+
+    # 1-3: true dist → analog voltage (+ voltage noise).
+    volts = max(0.0, ir_distance_to_volts(true_d_cm, cal) + _gauss(cal.voltage_noise_std))
+    # 4: volts → ADC count (+ ADC-side noise before firmware formula).
+    adc_f = (volts / cal.adc_vref) * cal.adc_max_count + _gauss(cal.adc_noise_std)
+    adc = int(round(adc_f))
+    if adc < 0:
+        adc = 0
+    if adc > cal.adc_max_count:
+        adc = cal.adc_max_count
+    # 5-6: firmware-side convert with saturation.
+    reported_mm = ir_firmware_convert(adc, side, sat_mm=cal.sat_mm)
+    reported_cm = reported_mm / 10.0
+    # Valid = not at the out-of-range sentinel (matches firmware semantics).
+    valid = adc >= side.adc_threshold and reported_mm < cal.sat_mm
     return {
         "id": placement.id,
-        "distance_cm": reported_d,
+        "distance_cm": reported_cm,
+        "distance_mm": reported_mm,
         "valid": valid,
         "adc": adc,
         "volts": volts,
@@ -97,7 +114,7 @@ def sample_sensors(walls: list[Segment], pose: Pose, cal: SensorCalibration) -> 
             "right":  lidar_reading(walls, pose, lr, cal.lidar),
         },
         "ir": {
-            "left":  ir_reading(walls, pose, il, cal.ir),
-            "right": ir_reading(walls, pose, ir_p, cal.ir),
+            "left":  ir_reading(walls, pose, il,  cal.ir, cal.ir_side(il.id)),
+            "right": ir_reading(walls, pose, ir_p, cal.ir, cal.ir_side(ir_p.id)),
         },
     }

@@ -1,16 +1,25 @@
-"""Bicycle-model dynamics integrated at 1 ms with first-order motor lag and a
-servo slew limiter. Rear-wheel differential drive gives asymmetric thrust; the
-front steer angle + wheelbase set the geometric turn radius (slip allowed
-through lateral friction)."""
+"""Bicycle-model dynamics integrated at 1 ms with first-order motor lag, a
+servo slew limiter, and per-actuator transport delay (queues that hold
+recently-commanded setpoints until LAG seconds have elapsed). Rear-wheel
+differential drive gives asymmetric thrust; the front steer angle +
+wheelbase set the geometric turn radius (slip allowed through lateral
+friction).
+
+Top speed is **not** clamped by `MAX_SPEED_CMS` in this module — terminal
+velocity emerges naturally from the force/drag balance. The constant is
+kept in `constants.py` as a measured reference value and a fit-bound
+sanity check.
+"""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 
 from .constants import (
-    G, INERTIA_KG_M2, LINEAR_DRAG, MASS_KG, MAX_SPEED_CMS, MOTOR_LAG_TAU_S,
+    G, INERTIA_KG_M2, LINEAR_DRAG, MASS_KG, MOTOR_LAG_TAU_S,
     MOTOR_MAX_FORCE_N, MU_KINETIC, MU_STATIC, PHYSICS_DT_S, REAR_TRACK_CM,
-    ROLLING_RESIST, SERVO_RAD_PER_SEC, STEER_LIMIT_RAD, WHEELBASE_CM,
+    ROLLING_RESIST, SERVO_RAD_PER_SEC, STEER_LIMIT_RAD,
+    STEER_TRANSPORT_LAG_S, THROTTLE_TRANSPORT_LAG_S, WHEELBASE_CM,
     duty_count_to_pwm01, servo_count_to_steer_angle,
 )
 from .geometry import Segment, chassis_segments, seg_intersect
@@ -36,12 +45,20 @@ class RobotState:
     v: float = 0.0            # forward body speed, cm/s
     omega: float = 0.0        # yaw rate, rad/s
     steer_angle: float = 0.0  # actual wheel angle (rad), servo-limited
-    steer_cmd: float = 0.0    # commanded wheel angle (rad)
+    steer_cmd: float = 0.0    # active wheel-angle setpoint (rad), post-lag
     motor_force_l: float = 0.0  # filtered rear-left force, N
     motor_force_r: float = 0.0
-    motor_cmd_l: float = 0.0
+    motor_cmd_l: float = 0.0  # active rear-left force setpoint (N), post-lag
     motor_cmd_r: float = 0.0
     collided: bool = False
+    # Sim time accumulator used by the transport-delay queues. Reset to 0
+    # whenever apply_command is first called on a fresh state.
+    sim_t_s: float = 0.0
+    # Pending command queues: (release_time_s, value) tuples written by
+    # apply_command, drained by _integrate_dynamics once sim_t_s >=
+    # release_time_s. Cap kept short by drop-on-consume.
+    steer_cmd_queue: list = field(default_factory=list)
+    motor_cmd_queue: list = field(default_factory=list)
 
 
 def _lag(current: float, target: float, tau: float, dt: float) -> float:
@@ -57,13 +74,46 @@ def apply_command(
     dir_l: int = 1,
     dir_r: int = 1,
 ) -> None:
-    """Convert firmware-style motor command into physical setpoints on `state`."""
-    state.steer_cmd = servo_count_to_steer_angle(servo)
-    state.motor_cmd_l = dir_l * duty_count_to_pwm01(duty_l) * MOTOR_MAX_FORCE_N
-    state.motor_cmd_r = dir_r * duty_count_to_pwm01(duty_r) * MOTOR_MAX_FORCE_N
+    """Queue a firmware-style motor command. The command becomes active on
+    the state setpoint after `STEER_TRANSPORT_LAG_S` / `THROTTLE_TRANSPORT_LAG_S`
+    of sim time elapses, modelling the CAN + PWM-cycle + servo-deadband chain
+    between the firmware Robot() loop emitting a command and the actuator
+    physically responding."""
+    steer_target = servo_count_to_steer_angle(servo)
+    motor_l_target = dir_l * duty_count_to_pwm01(duty_l) * MOTOR_MAX_FORCE_N
+    motor_r_target = dir_r * duty_count_to_pwm01(duty_r) * MOTOR_MAX_FORCE_N
+    t_now = state.sim_t_s
+    state.steer_cmd_queue.append((t_now + STEER_TRANSPORT_LAG_S, steer_target))
+    state.motor_cmd_queue.append(
+        (t_now + THROTTLE_TRANSPORT_LAG_S, motor_l_target, motor_r_target)
+    )
+
+
+def _drain_queue_setpoint(queue: list, t_now: float):
+    """Pop entries whose release time has passed, return the latest released
+    value (or None if nothing has been released yet). Drops earlier consumed
+    entries except the most-recent-released one (so LAG can be rebound on the
+    fly without losing the current setpoint)."""
+    latest_released = None
+    while queue and queue[0][0] <= t_now:
+        latest_released = queue.pop(0)
+    return latest_released
 
 
 def _integrate_dynamics(state: RobotState, dt: float) -> None:
+    # Advance sim clock so transport-lag queues know when commands release.
+    state.sim_t_s += dt
+
+    # Drain transport-delay queues: any commands whose release time has
+    # passed become the active setpoint.
+    released = _drain_queue_setpoint(state.steer_cmd_queue, state.sim_t_s)
+    if released is not None:
+        state.steer_cmd = released[1]
+    released = _drain_queue_setpoint(state.motor_cmd_queue, state.sim_t_s)
+    if released is not None:
+        state.motor_cmd_l = released[1]
+        state.motor_cmd_r = released[2]
+
     # Servo slew.
     steer_err = state.steer_cmd - state.steer_angle
     max_step = SERVO_RAD_PER_SEC * dt
@@ -80,6 +130,10 @@ def _integrate_dynamics(state: RobotState, dt: float) -> None:
     v_ms = state.v / 100.0
 
     # Longitudinal dynamics: drive - rolling resist - drag, bounded by tire mu.
+    # Terminal velocity emerges from f_drive == f_roll + f_drag — no hard
+    # speed governor (the old `MAX_SPEED_CMS` clamp was removed because it
+    # made `accel_y` flat at zero in sim once the cap was hit, breaking the
+    # IMU-based dynamics fit).
     f_drive = state.motor_force_l + state.motor_force_r
     f_roll = math.copysign(ROLLING_RESIST * MASS_KG * G, v_ms) if v_ms != 0 else 0.0
     f_drag = LINEAR_DRAG * v_ms
@@ -90,8 +144,6 @@ def _integrate_dynamics(state: RobotState, dt: float) -> None:
     # Dead-zone friction (stick when at rest and drive < breakout).
     if abs(v_new) < 0.005 and abs(f_drive) < ROLLING_RESIST * MASS_KG * G * 1.5:
         v_new = 0.0
-    v_max = MAX_SPEED_CMS / 100.0
-    v_new = max(-v_max, min(v_max, v_new))
 
     # Yaw: differential torque from rear wheels + bicycle geometric turn rate.
     yaw_torque = (state.motor_force_r - state.motor_force_l) * (_TRACK_M / 2.0)

@@ -17,8 +17,19 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ...sim.engine import SimEngine
-from ...sim.physics import RobotState, initial_robot
+from ...control.pd_baseline import PDBaseline, compute_geometry, ir_correction
+from ...env.robot_env import (
+    RobotEnv, build_observation, sensors_to_mm, steer_deg_to_servo_count,
+)
+from ...sim.constants import (
+    MAX_SPEED_CMS, MOTOR_PWM_MAX_COUNT, PHYSICS_DT_S, SERVO_CENTER_COUNT,
+    SERVO_MAX_COUNT, SERVO_MIN_COUNT, STEER_LIMIT_RAD,
+)
+from ...sim.geometry import chassis_segments
+from ...sim.imu import IMUSimulator
+from ...sim.model import action_to_delta, apply_residual
+from ...sim.physics import RobotState, apply_command, initial_robot, step_physics
+from ...sim.sensors import sample_sensors
 from ..app_state import AppState, RobotSpec
 from ..canvas import TrackCanvas
 from ..training.linear_policy import (
@@ -31,19 +42,18 @@ from ..widgets.mpl_canvas import RewardCurve, WeightHeatmap
 CTRL_PERIOD_MS = 80.0
 PHYSICS_HZ = 60  # how often the GUI timer fires
 
-
-# Removed old _obs_from_sensors and _action_to_command
-
-
 class SimulationPage(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        self.engine = SimEngine()
         self._selected_robot: Optional[int] = None
         self._worker: Optional[TrainingWorker] = None
         self._W: Optional[np.ndarray] = None
         self._b: Optional[np.ndarray] = None
+        self._steps_since_ctrl: dict[int, float] = {}
+        # Per-robot policy state for the residual RL controller (see
+        # _compute_command "rl" branch). Lazy-init in _ensure_rl_state.
+        self._rl_state: dict[int, dict] = {}
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -264,11 +274,11 @@ class SimulationPage(QWidget):
         lay.addLayout(grid)
 
         row2 = QHBoxLayout()
-        self.chk_respawn = QCheckBox("Auto-respawn RL robots on crash")
+        self.chk_respawn = QCheckBox("Auto-respawn on crash")
         self.chk_respawn.setChecked(True)
         self.chk_respawn.setToolTip(
-            "When an 'rl'-controlled robot collides, reset it to its spawn "
-            "pose so you can keep watching the policy act."
+            "When a robot collides, reset it to its spawn pose so it keeps "
+            "running. Applies to all controllers (RL, PD, C, manual)."
         )
         row2.addWidget(self.chk_respawn)
         row2.addStretch(1)
@@ -430,7 +440,14 @@ class SimulationPage(QWidget):
         if rid == self._selected_robot:
             self._sync_selected_spinboxes()
         # Running state stays in sync: snap live runtime to the new spawn.
+<<<<<<< HEAD
         self.engine.force_robot_pose(rid, x, y, theta)
+=======
+        if rid in self._runtimes:
+            self._runtimes[rid] = initial_robot(x, y, theta)
+            self._steps_since_ctrl[rid] = 0.0
+            self._reset_rl_state(rid)
+>>>>>>> origin/main
 
     def _on_sel_edited(self) -> None:
         if self._selected_robot is None:
@@ -447,7 +464,16 @@ class SimulationPage(QWidget):
         if item is not None:
             item.setPos(self.sel_x.value(), self.sel_y.value())
             item.setRotation(self.sel_theta.value())
+<<<<<<< HEAD
         self.engine.force_robot_pose(rid, self.sel_x.value(), self.sel_y.value(), math.radians(self.sel_theta.value()))
+=======
+        if rid in self._runtimes:
+            self._runtimes[rid] = initial_robot(
+                self.sel_x.value(), self.sel_y.value(),
+                math.radians(self.sel_theta.value()))
+            self._steps_since_ctrl[rid] = 0.0
+            self._reset_rl_state(rid)
+>>>>>>> origin/main
 
     def _on_ring_angle(self, rid: int, theta: float) -> None:
         self.state.update_robot(rid, theta=theta)
@@ -458,7 +484,13 @@ class SimulationPage(QWidget):
         if rid in self.engine.runtimes:
             spec = next((r for r in self.state.robots if r.id == rid), None)
             if spec is not None:
+<<<<<<< HEAD
                 self.engine.force_robot_pose(rid, spec.x, spec.y, theta)
+=======
+                self._runtimes[rid] = initial_robot(spec.x, spec.y, theta)
+                self._steps_since_ctrl[rid] = 0.0
+                self._reset_rl_state(rid)
+>>>>>>> origin/main
         self.canvas.sync_ring_to_selected()
 
     def _rotate_selected(self, direction: int) -> None:
@@ -477,8 +509,15 @@ class SimulationPage(QWidget):
         item = self.canvas._robot_items.get(spec.id)
         if item is not None:
             item.setRotation(math.degrees(new_theta))
+<<<<<<< HEAD
         if spec.id in self.engine.runtimes:
             self.engine.force_robot_pose(spec.id, spec.x, spec.y, new_theta)
+=======
+        if spec.id in self._runtimes:
+            self._runtimes[spec.id] = initial_robot(spec.x, spec.y, new_theta)
+            self._steps_since_ctrl[spec.id] = 0.0
+            self._reset_rl_state(spec.id)
+>>>>>>> origin/main
 
     # ---- sim loop --------------------------------------------------------
 
@@ -494,10 +533,34 @@ class SimulationPage(QWidget):
         self.btn_play.setText("⏸ Pause")
 
     def _reset_runtimes(self) -> None:
+<<<<<<< HEAD
         self.engine.reset_runtimes(self.state.robots)
         self.canvas._rebuild_robots()  # snap visuals back
         self._update_telemetry()
 
+=======
+        self._runtimes = {}
+        self._steps_since_ctrl = {}
+        self._rl_state = {}
+        self._ensure_runtimes()
+        self.canvas._rebuild_robots()  # snap visuals back
+        self._update_telemetry()
+
+    def _ensure_runtimes(self) -> None:
+        for r in self.state.robots:
+            if r.id not in self._runtimes:
+                self._runtimes[r.id] = initial_robot(r.x, r.y, r.theta)
+                self._steps_since_ctrl[r.id] = 0.0
+
+    def _prune_runtimes(self) -> None:
+        live_ids = {r.id for r in self.state.robots}
+        for rid in list(self._runtimes.keys()):
+            if rid not in live_ids:
+                self._runtimes.pop(rid, None)
+                self._steps_since_ctrl.pop(rid, None)
+                self._rl_state.pop(rid, None)
+
+>>>>>>> origin/main
     def _tick(self) -> None:
         self.engine.time_scale = self._time_scale
         self.engine.cars_interact = self.chk_cars_interact.isChecked()
@@ -515,8 +578,41 @@ class SimulationPage(QWidget):
 
         # Push to canvas visuals.
         for r in self.state.robots:
+<<<<<<< HEAD
             state = self.engine.runtimes.get(r.id)
             if state is None: continue
+=======
+            state = self._runtimes[r.id]
+            # When cars_interact: other cars' chassis edges act as dynamic wall
+            # segments so this robot both SEES them (lidar/IR rays) and COLLIDES
+            # with them (inside step_physics). Otherwise ghost mode — each car
+            # is alone in its own perception of the track.
+            if cars_interact:
+                other_walls = self._other_car_segments(r.id, dims)
+                effective_walls = walls + other_walls
+            else:
+                effective_walls = walls
+            for _ in range(n_phys):
+                # Apply control at CTRL_PERIOD boundaries.
+                self._steps_since_ctrl[r.id] += dt * 1000.0
+                if self._steps_since_ctrl[r.id] >= CTRL_PERIOD_MS:
+                    self._steps_since_ctrl[r.id] = 0.0
+                    sensors = sample_sensors(effective_walls, state.pose, cal)
+                    duty_l, duty_r, servo = self._compute_command(r, state, sensors)
+                    apply_command(state, duty_l, duty_r, servo)
+                step_physics(state, effective_walls, dims.chassis_length_cm,
+                             dims.chassis_width_cm, dt)
+                if state.collided:
+                    break
+            # Auto-respawn on crash so the robot keeps running.
+            if state.collided and self.chk_respawn.isChecked():
+                self._runtimes[r.id] = initial_robot(r.x, r.y, r.theta)
+                self._steps_since_ctrl[r.id] = 0.0
+                if r.controller_id == "rl":
+                    self._reset_rl_state(r.id)
+                state = self._runtimes[r.id]
+            # Push to canvas visuals.
+>>>>>>> origin/main
             item = self.canvas._robot_items.get(r.id)
             if item is not None:
                 item.setPos(state.pose.x, state.pose.y)
@@ -524,6 +620,90 @@ class SimulationPage(QWidget):
         self.canvas.sync_ring_to_selected()
         self._update_telemetry()
 
+<<<<<<< HEAD
+=======
+    def _other_car_segments(self, me_id: int, dims) -> list:
+        """Chassis segments of every other live robot, in world frame.
+        These become obstacles for this robot's sensors and physics."""
+        out = []
+        for other in self.state.robots:
+            if other.id == me_id:
+                continue
+            rt = self._runtimes.get(other.id)
+            if rt is None:
+                continue
+            pose = (rt.pose.x, rt.pose.y, rt.pose.theta)
+            out.extend(chassis_segments(pose, dims.chassis_length_cm,
+                                        dims.chassis_width_cm))
+        return out
+
+    def _ensure_rl_state(self, rid: int) -> dict:
+        s = self._rl_state.get(rid)
+        if s is None:
+            s = {
+                "pd": PDBaseline(),
+                "imu": IMUSimulator(),
+                "prev_thr_l": 0.0,
+                "prev_thr_r": 0.0,
+                "prev_steer": 0.0,
+                "sim_t_s": 0.0,
+            }
+            self._rl_state[rid] = s
+        return s
+
+    def _reset_rl_state(self, rid: int) -> None:
+        s = self._ensure_rl_state(rid)
+        s["pd"].reset()
+        s["imu"].reset(v_cms=0.0, t_s=0.0)
+        s["prev_thr_l"] = 0.0
+        s["prev_thr_r"] = 0.0
+        s["prev_steer"] = 0.0
+        s["sim_t_s"] = 0.0
+
+    def _compute_command(self, spec: RobotSpec, state: RobotState, sensors: dict):
+        """Returns (duty_l, duty_r, servo_count) — differential drive."""
+        cid = spec.controller_id
+        if cid == "manual-stop":
+            return 0, 0, SERVO_CENTER_COUNT
+        if cid == "manual-drive":
+            return 9000, 9000, SERVO_CENTER_COUNT
+        if cid == "rl":
+            # Residual-on-PD: policy outputs a delta added to the PD baseline.
+            # Untrained policy (zero W, zero b) ⇒ delta=0 ⇒ pure PD behavior,
+            # so the car drives reasonably even before training kicks in.
+            rs = self._ensure_rl_state(spec.id)
+            d_ir, ld_ir, d2, ld2, front = sensors_to_mm(sensors)
+            d_ir, ld_ir = ir_correction(d_ir, ld_ir, d2, ld2)
+            geom = compute_geometry(d_ir, ld_ir, d2, ld2, front)
+            pd = rs["pd"].tick(geom)
+            if self._W is None or self._b is None:
+                # No model loaded — fall back to pure PD (safe default).
+                thr_l, thr_r, steer_deg = pd.throttle_l, pd.throttle_r, pd.steering
+            else:
+                rs["sim_t_s"] += CTRL_PERIOD_MS / 1000.0
+                gz, ax, ay = rs["imu"].read(state, rs["sim_t_s"])
+                obs = build_observation(
+                    sensors, gz, ax, ay,
+                    rs["prev_thr_l"], rs["prev_thr_r"], rs["prev_steer"],
+                )
+                action = policy_forward(self._W, self._b, obs)
+                d_thr_l, d_thr_r, d_steer = action_to_delta(action)
+                thr_l, thr_r, steer_deg = apply_residual(
+                    pd.throttle_l, pd.throttle_r, pd.steering,
+                    d_thr_l, d_thr_r, d_steer,
+                )
+            rs["prev_thr_l"] = thr_l
+            rs["prev_thr_r"] = thr_r
+            rs["prev_steer"] = steer_deg
+            return int(thr_l), int(thr_r), steer_deg_to_servo_count(steer_deg)
+        # Named C/Python controller (e.g. pd_controller.c) — already differential.
+        ctrl = self.state.controllers.get(cid)
+        if ctrl is None:
+            return 0, 0, SERVO_CENTER_COUNT
+        cmd = ctrl.tick(sensors, 0.0)
+        return cmd.duty_l, cmd.duty_r, cmd.servo
+
+>>>>>>> origin/main
     def _update_telemetry(self) -> None:
         if self._selected_robot is None:
             self.telemetry.setPlainText("(no robot selected — click on one in the list or track)")

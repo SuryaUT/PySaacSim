@@ -6,16 +6,14 @@
 # real robot, find the row here that best describes the mismatch.
 
 ir:
-  # Voltage response of the lab's analog front-end (Sharp GP2Y0A41SK0F + op-amp
-  # + voltage divider). v(d_cm) = curve_k / (d_cm + curve_c) for d >= peak_cm.
+  # Shared analog front-end (same GP2Y0A sensor on both sides).
+  # Model:  v(d_cm) = curve_k / (d_cm + curve_c) + floor_v   (d >= peak_cm)
   #
-  # Defaults make IRDistance_Convert(adc) return 2 x true_mm, matching the
-  # actual robot (firmware's /2 in DAS then recovers true mm). If the op-amp
-  # gain is changed in hardware, rescale curve_k:
-  #   - real robot behavior (2x):  curve_k = 12.79,  curve_c = 0.585
-  #   - bare Sharp datasheet:      curve_k = 25.58,  curve_c = 1.17  (1x out)
-  curve_k: 12.79
-  curve_c: 0.585
+  # Fit from the user's 2026-04-21 measurement (ADC averaged L/R, Vref=3.3,
+  # 12-bit); 3-param curve_fit → max residual ≈ 0.09 V across the full range.
+  curve_k: 10.7489
+  curve_c: -2.7760
+  floor_v: 0.7879
 
   # Non-monotonic regime boundary. Below this, voltage rises linearly from
   # peak_floor_v at contact up to the curve value at peak_cm.
@@ -24,18 +22,39 @@ ir:
   v_clamp: 3.1          # ADC rails at Vref
 
   # Reported-valid range. Outside this the reading is flagged invalid.
+  # Firmware saturates at 305 mm (see IRDistance.c) → max_cm = 30.5.
   min_cm: 4.0
-  max_cm: 30.0
+  max_cm: 30.5
 
-  # Gaussian noise added before ADC conversion / after distance reporting.
-  distance_noise_std_cm: 0.4
+  # Noise knobs. Applied before the firmware formula so noise is shaped the
+  # same way a real sensor's is (ADC discretization comes after).
   voltage_noise_std: 0.02
+  adc_noise_std: 0.0        # counts (Phase 2 will fit this from IR_Calib.xlsx)
 
   adc_max_count: 4095
   adc_vref: 3.3
 
+  # Firmware per-side formula (see RTOS_Labs_common/IRDistance.c):
+  #   d_mm = a / (adc + b) + c,  saturates at 305 mm when adc < adc_threshold.
+  # Bootstrap values = current firmware constants; Phase 2 re-fits from
+  # IR_Calib.xlsx and proposes an update if the new fit disagrees >5%.
+  left:
+    a: 137932
+    b: -859
+    c: 32
+    adc_threshold: 1376
+  right:
+    a: 52850
+    b: -1239
+    c: 69
+    adc_threshold: 1476
+  sat_mm: 305.0
+
 lidar:
-  max_cm: 800.0         # TF-Luna spec: 8 m max
+  # Capped to 1 m (matches CAP_TFLUNA = 1000 mm). TF-Luna hardware spec is 8 m,
+  # but the sim and model both treat 1 m as the reportable range for
+  # wall-following — anything further is normalized to 1.0 and clipped.
+  max_cm: 100.0
   # Measured: avg 163 mm, stdev 0.56 mm → 0.056 cm (SNR 291, 24.64 dB power).
   noise_std_cm: 0.056
   fov_rad: 0.0349       # ~2 deg (modeled as a single ray — FOV unused for now)
@@ -45,6 +64,22 @@ lidar:
   # Leave at defaults unless you measure a real offset against a known target.
   distance_scale: 1.0
   distance_bias_cm: 0.0
+
+imu:
+  # Firmware filter chain (see RTOS_SensorBoard/IMU.h):
+  #   IMU_DLPF_CFG=0x03 → 44 Hz BW;  IMU_AVG_SAMPLES=4 → 4-sample block avg.
+  dlpf_fc_hz: 44.0
+  avg_samples: 4
+  # Per-sample Gaussian noise (raw int16 LSB). Fit from the motors-on
+  # stationary capture in Phase 2.
+  gyro_noise_lsb: 0.0
+  accel_noise_lsb: 0.0
+  # Static bias, raw int16 LSB, (x, y, z). Sim emits bias-free signals;
+  # calib/replay.py subtracts these from real logs before comparison. Phase 2
+  # estimates these from the steady-state capture — flagged as coarse until
+  # a motors-off flat capture is available.
+  gyro_bias:  [0, 0, 0]
+  accel_bias: [0, 0, 0]
 
 # Sensor placements in body frame: +x forward, +y left, origin at chassis
 # center. Chassis is 29.5 × 19.0 cm, so half-length 14.75 and half-width 9.5.

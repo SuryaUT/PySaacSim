@@ -1,0 +1,23 @@
+IR fit: left  a=83326.4  b=-497.6  c=18.3  thr=790  RMSE=7.5 mm  (n=11)
+IR fit: right a=76921.0  b=-494.8  c=20.3  thr=765  RMSE=4.6 mm  (n=11)
+Noise: IR L/R mm std = 0.00 / 0.93; TF L/F/R mm std = 0.00 / 0.00 / 1.46
+IMU bias (LSB): gyro (0, 0, 46)  accel (264, -1074, 0)  (n=1716)
+IMU noise (LSB): gyro_z σ=13.4  accel_x σ=42.9  accel_y σ=48.7
+  WARNING: accel_y bias is much larger than accel_x — likely includes a pitch contribution, not a pure bias. Re-capture motors-off flat before trusting this value.
+Latency: steer→(-gyro_z) 160 ms (r=0.95); throttle→accel_y 80 ms (r=0.21)
+
+--- yaml diff ---
+  imu.accel_bias: [0, 0, 0]  ->  [264, -1074, 0]
+  imu.accel_noise_lsb: 0.0  ->  45.797650727443525
+  imu.gyro_bias: [0, 0, 0]  ->  [0, 0, 46]
+  imu.gyro_noise_lsb: 0.0  ->  13.424897648958808
+  ir.adc_noise_std: 0.0  ->  5.76646729229793
+  ir.left.a: 137932  ->  83326.42056584713
+  ir.left.adc_threshold: 1376  ->  790
+  ir.left.b: -859  ->  -497.6065058553148
+  ir.left.c: 32  ->  18.261667887965352
+  ir.right.a: 52850  ->  76921.03097183381
+  ir.right.adc_threshold: 1476  ->  765
+  ir.right.b: -1239  ->  -494.77256553555077
+  ir.right.c: 69  ->  20.310107914349945
+  lidar.noise_std_cm: 0.056  ->  0.14644058294648338
