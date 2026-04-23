@@ -54,9 +54,19 @@ MOTOR_PWM_HZ = 200
 MOTOR_MAX_FORCE_N = 5.0
 MOTOR_LAG_TAU_S = 0.100
 
-# Top speed governor: measured 1.219 m/s at full charge on the real robot
+# Top speed: measured 1.219 m/s at full charge on the real robot
 # (2026-04-22, smooth lab tile). Supersedes the earlier 0.47 m/s figure.
+# NOTE: This value is no longer enforced as a hard clamp by physics.py —
+# terminal velocity emerges from MOTOR_MAX_FORCE_N vs LINEAR_DRAG balance.
+# Kept here for reference and as a sanity-check ceiling in tests / fit bounds.
 MAX_SPEED_CMS = 122
+
+# Actuator transport delay between firmware command (sent over CAN) and the
+# motor/servo physically responding. Decomposition: CAN serialization (~5-10
+# ms), motor-board ISR + PWM register write (~1-5 ms), 50 Hz servo PWM cycle
+# wait (0-20 ms), servo internal deadband (5-15 ms). Both fitted by CMA-ES.
+STEER_TRANSPORT_LAG_S = 0.030
+THROTTLE_TRANSPORT_LAG_S = 0.030
 
 
 def duty_count_to_pwm01(count: int) -> float:

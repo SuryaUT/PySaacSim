@@ -99,17 +99,17 @@ def replay(
             )
             # Advance physics for 80 ms with the command held constant. No
             # walls → no collision; we care about the IMU+dynamics response.
+            # Capture the IMU output from the *last* in-loop tick so the
+            # dt seen by the IMU's dv/dt computation is the real physics dt
+            # (1 ms), not a near-zero "snapshot" that would zero out accel_y.
+            g_last, ax_last, ay_last = 0, 0, 0
             for _ in range(steps_per_row):
                 _integrate_dynamics(state, dt_phys)
                 t_now += dt_phys
                 # Drive the IMU filter at physics cadence so fc=44 Hz is honored.
-                imu.read(state, t_now)
-            # The "logged" IMU at this row is the last averaged sample.
+                g_last, ax_last, ay_last = imu.read(state, t_now)
             t_out[i] = t_now
-            # imu.read was called above on every tick; its last return is the
-            # current output. Grab it again without advancing time meaningfully.
-            g, a_x, a_y = imu.read(state, t_now)
-            gz[i] = g; ax[i] = a_x; ay[i] = a_y
+            gz[i] = g_last; ax[i] = ax_last; ay[i] = ay_last
             v[i] = state.v
             om[i] = state.omega
     finally:

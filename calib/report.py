@@ -20,6 +20,7 @@ from ..sim.calibration import (
     SensorCalibration,
 )
 from .ir_xlsx import IRXlsxFit
+from .tfluna_xlsx import TFLunaXlsxFit
 from .log_io import Log
 from .noise_fit import SensorNoiseFit
 from .imu_bias import IMUBiasEstimate
@@ -144,6 +145,7 @@ def apply_to_calibration(
     ir_fit: Optional[IRXlsxFit] = None,
     noise: Optional[SensorNoiseFit] = None,
     imu_bias: Optional[IMUBiasEstimate] = None,
+    tfluna_fit: Optional[TFLunaXlsxFit] = None,
 ) -> SensorCalibration:
     """Return a new SensorCalibration with proposed updates merged in."""
     out = current.copy()
@@ -173,4 +175,18 @@ def apply_to_calibration(
         out.imu.accel_noise_lsb = float(
             0.5 * (imu_bias.accel_x_std_lsb + imu_bias.accel_y_std_lsb)
         )
+    if tfluna_fit is not None and tfluna_fit.per_lidar:
+        # Single shared LidarCalibration for now — average per-lidar fits.
+        # If per-unit divergence later proves to matter for sim-to-real, the
+        # schema can be promoted to per-lidar fields without breaking older
+        # YAMLs.
+        scales = [s.scale for s in tfluna_fit.per_lidar.values()]
+        biases_cm = [s.bias_cm for s in tfluna_fit.per_lidar.values()]
+        noises_cm = [s.noise_std_cm for s in tfluna_fit.per_lidar.values()]
+        out.lidar.distance_scale = float(np.mean(scales))
+        out.lidar.distance_bias_cm = float(np.mean(biases_cm))
+        # Use the larger of (xlsx residual std, in-log noise std) so the
+        # simulated noise is at least as wide as the real-world noise floor.
+        if noises_cm:
+            out.lidar.noise_std_cm = max(out.lidar.noise_std_cm, float(np.mean(noises_cm)))
     return out

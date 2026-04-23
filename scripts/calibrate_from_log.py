@@ -42,6 +42,7 @@ from PySaacSim.sim.calibration import (  # noqa: E402
 )
 from PySaacSim.calib.log_io import load_log, load_logs  # noqa: E402
 from PySaacSim.calib.ir_xlsx import fit_xlsx as fit_ir_xlsx  # noqa: E402
+from PySaacSim.calib.tfluna_xlsx import fit_xlsx as fit_tfluna_xlsx  # noqa: E402
 from PySaacSim.calib.imu_bias import estimate_bias  # noqa: E402
 from PySaacSim.calib.noise_fit import fit_noise  # noqa: E402
 from PySaacSim.calib.latency import estimate as estimate_latency  # noqa: E402
@@ -80,17 +81,44 @@ def main(argv=None) -> int:
     print("[1/5] Fitting IR formula per side from xlsx...")
     ir_fit = fit_ir_xlsx(args.ir_xlsx)
 
-    # --- Phase 2b: IMU bias from steady capture -----------------------------
+    # Per-lidar TFLuna fit from the same xlsx (Sensor_Calib has a `LiDARs`
+    # sheet; older `IR_Calib.xlsx` had none and this returns None).
+    tfluna_fit = fit_tfluna_xlsx(args.ir_xlsx)
+    if tfluna_fit is not None:
+        scales = [s.scale for s in tfluna_fit.per_lidar.values()]
+        biases_mm = [s.bias_cm * 10.0 for s in tfluna_fit.per_lidar.values()]
+        print(f"  TFLuna per-lidar: scales {scales}, biases (mm) {biases_mm}")
+
+    # --- Phase 2b: IMU bias + noise from steady capture ---------------------
+    # Steady CSV is motors-off (sensor board only) — IMU columns are pure
+    # bias + sensor noise, but IR / TFLuna columns are NOT pointed at
+    # calibration targets and must not be used for sensor-noise fitting.
     print("[2/5] IMU bias + noise from steady capture...")
     steady = load_log(args.steady_csv)
     bias = estimate_bias(steady)
-    noise = fit_noise(steady, current.ir)
 
     # --- Phase 3: latency cross-correlation across drive logs ---------------
     print("[3/5] Latency identification...")
     drive_paths = list(args.drive_csvs)
     drive_logs = load_logs(drive_paths)
     latency = estimate_latency(drive_logs)
+
+    # --- Phase 2c: IR / TFLuna noise std from a quiescent driving-log window.
+    # find_quiescent only returns windows where |gyro_z| stays low; if the
+    # car never sits still mid-log, no window is found and we skip the noise
+    # update (existing YAML defaults stay in place).
+    print("  IR / TFLuna noise from a quiescent driving-log window...")
+    noise = None
+    for L in drive_logs:
+        try:
+            noise = fit_noise(L, current.ir)
+            print(f"    used quiescent window from {L.path.name}")
+            break
+        except ValueError:
+            continue
+    if noise is None:
+        print("    WARNING: no quiescent window in any driving log;"
+              " IR/TFLuna noise stays at YAML defaults.")
 
     # --- Phase 4: CMA-ES dynamics fit (optional) ----------------------------
     dyn_result = None
@@ -109,6 +137,7 @@ def main(argv=None) -> int:
         # the right IMU LPF/avg knobs from the start.
         interim = report_mod.apply_to_calibration(
             current, ir_fit=ir_fit, noise=noise, imu_bias=bias,
+            tfluna_fit=tfluna_fit,
         )
         # Use the IMU noise std from the steady capture to whiten the loss.
         sigma = (
@@ -137,15 +166,19 @@ def main(argv=None) -> int:
     print("[5/5] Writing artifacts...")
     proposed = report_mod.apply_to_calibration(
         current, ir_fit=ir_fit, noise=noise, imu_bias=bias,
+        tfluna_fit=tfluna_fit,
     )
     proposed.to_yaml(out_dir / "proposed.yaml")
 
     diff_text = report_mod.yaml_diff(current, proposed)
-    (out_dir / "diff.txt").write_text(diff_text + "\n")
+    (out_dir / "diff.txt").write_text(diff_text + "\n", encoding="utf-8")
 
     lines = report_mod.summary_lines(ir_fit, noise, bias, latency, dyn_result)
     summary_path = out_dir / "summary.txt"
-    summary_path.write_text("\n".join(lines) + "\n\n--- yaml diff ---\n" + diff_text + "\n")
+    summary_path.write_text(
+        "\n".join(lines) + "\n\n--- yaml diff ---\n" + diff_text + "\n",
+        encoding="utf-8",
+    )
 
     if dyn_result is not None:
         dyn_json = {
@@ -159,7 +192,7 @@ def main(argv=None) -> int:
             dyn_json["loss_holdout"] = dyn_result.holdout_loss
         if dyn_result.cov is not None:
             dyn_json["cov_diag"] = np.diag(dyn_result.cov).tolist()
-        (out_dir / "dynamics.json").write_text(json.dumps(dyn_json, indent=2))
+        (out_dir / "dynamics.json").write_text(json.dumps(dyn_json, indent=2), encoding="utf-8")
 
         overlays_dir = out_dir / "overlays"
         written = report_mod.plot_overlays(

@@ -1,0 +1,26 @@
+{
+  "param_names": [
+    "MOTOR_MAX_FORCE_N",
+    "MOTOR_LAG_TAU_S",
+    "LINEAR_DRAG",
+    "ROLLING_RESIST",
+    "SERVO_RAD_PER_SEC",
+    "MU_KINETIC"
+  ],
+  "x": [
+    14.2158,
+    0.02,
+    0.7844,
+    0.0002,
+    1.0162,
+    0.2174
+  ],
+  "loss_train": 58660.55,
+  "per_log_loss": [
+    56312.12669733273,
+    43576.37415491041,
+    75356.10355418586
+  ],
+  "loss_holdout": 81523.95523625884,
+  "n_evals": 0
+}

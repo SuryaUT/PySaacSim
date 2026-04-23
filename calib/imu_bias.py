@@ -1,11 +1,12 @@
-"""Estimate static IMU bias from a motors-on or motors-off stationary capture.
+"""Estimate static IMU bias from a motors-off stationary capture.
 
 The output is raw int16 LSB offsets per axis, matching what the firmware
-would need to subtract to zero the sensor at rest. For `IMU_steady_state.csv`
-the motors are on (throttle=9999 throughout), so the signal contains motor
-vibration; the mean still gives a good bias estimate, but accel_y will
-include any pitch-contribution if the chassis isn't perfectly level (the
-plan flags accel_y ≈ -1100 LSB as likely partly-pitch).
+would need to subtract to zero the sensor at rest. `IMU_steady_state.csv`
+on this robot was captured with **only the sensor board powered** (motor
+board off), so the IMU readings are pure sensor noise around the chip's
+static offsets — no motor vibration mixed in. The means are clean biases.
+(The throttle column shows 9999 because the firmware register held a stale
+value; the motors had no power, so it isn't an actual command.)
 """
 from __future__ import annotations
 
@@ -46,16 +47,7 @@ def estimate_bias(log: Log, window: Window | None = None) -> IMUBiasEstimate:
     gyro_bias_z = int(round(float(np.mean(gz))))
     accel_bias_x = int(round(float(np.mean(ax))))
     accel_bias_y = int(round(float(np.mean(ay))))
-    # Caveat for the motors-on capture (accel_y ~ -1100 LSB suggests either
-    # ~4° nose-up pitch or a real bias): flag when |accel_bias_y| is much
-    # larger than the x/z biases, since that's the tell.
     notes = ""
-    if abs(accel_bias_y) > 500 and abs(accel_bias_x) < 300:
-        notes = (
-            "WARNING: accel_y bias is much larger than accel_x — likely includes"
-            " a pitch contribution, not a pure bias. Re-capture motors-off flat"
-            " before trusting this value."
-        )
     return IMUBiasEstimate(
         gyro_bias=(0, 0, gyro_bias_z),
         accel_bias=(accel_bias_x, accel_bias_y, 0),

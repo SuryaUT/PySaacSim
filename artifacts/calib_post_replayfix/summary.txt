@@ -1,0 +1,16 @@
+IR fit: left  a=64896.9  b=-1158.1  c=64.8  thr=1429  RMSE=34.8 mm  (n=6)
+IR fit: right a=101120.2  b=-1078.3  c=41.6  thr=1463  RMSE=20.1 mm  (n=6)
+Noise: IR L/R mm std = 0.00 / 0.93; TF L/F/R mm std = 0.00 / 0.00 / 1.46
+IMU bias (LSB): gyro (0, 0, 46)  accel (264, -1074, 0)  (n=1716)
+IMU noise (LSB): gyro_z σ=13.4  accel_x σ=42.9  accel_y σ=48.7
+  WARNING: accel_y bias is much larger than accel_x — likely includes a pitch contribution, not a pure bias. Re-capture motors-off flat before trusting this value.
+Latency: steer→(-gyro_z) 160 ms (r=0.95); throttle→accel_y 80 ms (r=0.21)
+Dynamics fit (n=0):
+  MOTOR_MAX_FORCE_N      14.2158
+  MOTOR_LAG_TAU_S        0.0200
+  LINEAR_DRAG            0.7844
+  ROLLING_RESIST         0.0002
+  SERVO_RAD_PER_SEC      1.0162
+  MU_KINETIC             0.2174
+  loss (train): 58660.5500
+  loss (holdout): 81523.9552

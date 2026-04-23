@@ -36,16 +36,27 @@ PARAM_NAMES = (
     "ROLLING_RESIST",
     "SERVO_RAD_PER_SEC",
     "MU_KINETIC",
+    "STEER_TRANSPORT_LAG_S",
+    "THROTTLE_TRANSPORT_LAG_S",
 )
 
-DEFAULT_X0 = np.array([5.0, 0.100, 0.1, 0.02, 6.16, 0.6], dtype=float)
+# Defaults seeded from the v1 (6-param) fit's best point + 30 ms transport lags.
+DEFAULT_X0 = np.array(
+    [14.22, 0.10, 0.78, 0.0, 5.0, 0.22, 0.030, 0.030], dtype=float
+)
 BOUNDS = np.array([
-    [1.0,  20.0],
-    [0.02, 0.5 ],
-    [0.01, 2.0 ],
-    [0.0,  0.2 ],
-    [1.0,  20.0],
-    [0.1,  1.5 ],
+    [1.0,  20.0 ],   # MOTOR_MAX_FORCE_N
+    [0.02, 0.5  ],   # MOTOR_LAG_TAU_S
+    [0.01, 10.0 ],   # LINEAR_DRAG (relaxed upper from 2.0 → 10.0; terminal
+                     # velocity from drag balance needs higher drag now that
+                     # the hard speed governor is removed)
+    [0.0,  0.2  ],   # ROLLING_RESIST
+    [4.0,  20.0 ],   # SERVO_RAD_PER_SEC (lower tightened 1.0 → 4.0; below 4
+                     # rad/s means we're hiding latency in slew rather than
+                     # the new transport lag — datasheet says 6.16 unloaded)
+    [0.1,  1.5  ],   # MU_KINETIC
+    [0.0,  0.150],   # STEER_TRANSPORT_LAG_S (CAN+PWM+servo-deadband chain)
+    [0.0,  0.150],   # THROTTLE_TRANSPORT_LAG_S
 ], dtype=float)
 WEIGHTS = np.array([1.0, 0.5, 1.0], dtype=float)  # (gz, ax, ay)
 
